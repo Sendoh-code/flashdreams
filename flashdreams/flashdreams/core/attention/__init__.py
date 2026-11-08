@@ -8,6 +8,7 @@ from flashdreams.core.attention.kvcache import (
     BlockKVCache,
     FixedSlotKVCache,
     LayerKV,
+    LayerwiseKVOffload,
     SlotRegion,
     TokenWindow,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "FixedSlotKVCache",
     "KVCacheRelativeRotaryPositionEmbedding3D",
     "LayerKV",
+    "LayerwiseKVOffload",
     "NativeAttention",
     "RotaryPositionEmbedding3D",
     "SlotRegion",

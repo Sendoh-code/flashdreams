@@ -17,6 +17,7 @@ from flashdreams.accelerated.quantization.linear import (
     QuantizedNonPersistentLinear,
     WeightGranularity,
 )
+from flashdreams.core.attention import LayerwiseKVOffload
 from flashdreams.recipes.wan.transformer.impl.network import (
     WanDiTNetwork,
     WanDiTNetworkCache,
@@ -146,6 +147,35 @@ class LingbotWorldDiTNetwork(WanDiTNetwork):
                 block.self_attn.refresh_derived_weights()
         if self.linear_backend == "rowwise_fp8":
             _replace_large_block_linears_with_fp8(self.blocks)
+
+    def initialize_cache(
+        self,
+        chunk_size: int,
+        window_size: int,
+        sink_size: int,
+        text_embeddings: Tensor,
+        img_embeddings: Tensor | None = None,
+        kv_offload: LayerwiseKVOffload | None = None,
+    ) -> WanDiTNetworkCache:
+        """Build block caches; offloaded K/V skips Sage key-history reuse.
+
+        The reused key sum is read from the K buffer in ``before_update``,
+        which lives on the host under offload. Sage then centers on the full
+        key mean itself, matching the reused-sum result.
+        """
+        cache = super().initialize_cache(
+            chunk_size,
+            window_size,
+            sink_size,
+            text_embeddings,
+            img_embeddings,
+            kv_offload=kv_offload,
+        )
+        if kv_offload is not None:
+            for block_cache in cache.block_caches:
+                assert isinstance(block_cache, CamCtrlBlockCache)
+                block_cache.reuse_key_history = False
+        return cache
 
     def _build_block(self, layer_idx: int) -> CamCtrlBlock:
         return CamCtrlBlock(

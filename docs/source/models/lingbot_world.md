@@ -62,6 +62,7 @@ uv run --no-sync flashdreams-run-v2 cam2v-lingbot \
 | `cam2v-lingbot-world-v2-14b-causal-fast-taehv-window15-sink3` | LingBot-World v2 14B causal-fast with TAEHV and bounded streaming KV cache. |
 | `cam2v-lingbot-world-v2-1p3b-causal-fast-perf` | LingBot-World v2 1.3B tuned for RTX 5090-class GPUs with row-wise FP8 and in-tree Sage attention. |
 | `cam2v-lingbot-world-v2-1p3b-causal-fast-perf-taehv` | The 1.3B performance preset with TAEHV decoding. |
+| `cam2v-lingbot-world-v2-1p3b-causal-fast-perf-fullkv-offload` | The 1.3B performance preset with a full 20-chunk KV cache kept in host memory and streamed two layers at a time. Set `FLASHDREAMS_KV_OFFLOAD_TIMING=1` to log per-layer fetch and compute times. |
 
 <hr>
 

@@ -12,6 +12,7 @@ from typing import Any, overload
 import torch
 from torch import Tensor
 
+from flashdreams.core.attention import LayerwiseKVOffload
 from flashdreams.core.attention.rope import (
     KVCacheRelativeRotaryPositionEmbedding3D,
     RotaryPositionEmbedding3D,
@@ -190,6 +191,16 @@ class Wan21TransformerConfig(TransformerConfig):
     cuda_graph_warmup_iters: int = 2
     """Eager calls before capture (>= 2 to drain Inductor autotune)."""
 
+    kv_offload: bool = False
+    """Keep self-attention K/V in pinned host memory and stream it layer by layer.
+
+    Layer ``i + 1`` is prefetched on a side stream while layer ``i`` computes,
+    and each layer's new chunk is written back right after it runs, so only
+    two layers of K/V (shared by cond and uncond) live on the device. Pair
+    with a ``window_size_t`` covering the whole rollout for a full KV cache.
+    Requires ``use_cuda_graph=False``; every forward is bound by host-to-device
+    bandwidth for the full visible history."""
+
     stamp_image_latent: bool = False
     """See class docstring (mask-inject I2V integration)."""
 
@@ -265,6 +276,8 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
         len_t = config.len_t // kt
         window_size_t = config.window_size_t // kt
         sink_size_t = config.sink_size_t // kt
+        if config.kv_offload and config.use_cuda_graph:
+            raise ValueError("kv_offload requires use_cuda_graph=False.")
         cuda_graph_capture_ar_idx = (
             cuda_graph_capture_ar_index(
                 sink_size_t=sink_size_t,
@@ -375,6 +388,7 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
         *,
         text_embeddings: Tensor,
         image_embeddings: Tensor | None = None,
+        kv_offload: LayerwiseKVOffload | None = None,
     ) -> WanDiTNetworkCache:
         """Build one network cache (cond or uncond branch).
 
@@ -408,6 +422,7 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
             sink_size=sink_size,
             text_embeddings=text_embeddings,
             img_embeddings=image_embeddings,
+            kv_offload=kv_offload,
         )
 
     @torch.no_grad()
@@ -460,9 +475,12 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
             f"cp_size={self._cp_size}"
         )
 
+        # One offload shared by both branches keeps device K/V at two layers.
+        kv_offload = LayerwiseKVOffload() if cfg.kv_offload else None
         network_cache = self._build_network_cache(
             text_embeddings=text_embeddings,
             image_embeddings=image_embeddings,
+            kv_offload=kv_offload,
         )
         network_cache_uncond: WanDiTNetworkCache | None = None
         if self.config.guidance_scale > 1.0:
@@ -474,6 +492,7 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
             network_cache_uncond = self._build_network_cache(
                 text_embeddings=negative_text_embeddings,
                 image_embeddings=image_embeddings,
+                kv_offload=kv_offload,
             )
 
         head_dim = self.config.network.dim // self.config.network.num_heads

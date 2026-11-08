@@ -7,13 +7,15 @@ Unit tests for BlockKVCache.
 
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 import torch
 
-from flashdreams.core.attention.kvcache import BlockKVCache
+from flashdreams.core.attention.kvcache import BlockKVCache, LayerwiseKVOffload
 from flashdreams.core.attention.rope import (
     KVCacheRelativeRotaryPositionEmbedding3D,
     RotaryPositionEmbedding3D,
@@ -167,6 +169,103 @@ def test_clone_and_overwrite_kv_preserve_storage_addresses() -> None:
     assert cache._v.data_ptr() == value_pointer
     torch.testing.assert_close(cache.cached_k(), keys + 10.0)
     torch.testing.assert_close(cache.cached_v(), values + 20.0)
+
+
+@pytest.mark.ci_cpu
+def test_layerwise_offload_matches_resident_caches() -> None:
+    """Offloaded layers see the same K/V as resident ones through two slots."""
+
+    def make() -> BlockKVCache:
+        return BlockKVCache(
+            k_shape=(1, 6, 1, 2),
+            v_shape=(1, 6, 1, 3),
+            seq_dim=1,
+            chunk_size=2,
+            window_size=4,
+            sink_size=2,
+            device="cpu",
+            dtype=torch.float32,
+        )
+
+    layers = 3
+    resident = [make() for _ in range(layers)]
+    offloaded = [make() for _ in range(layers)]
+    offload = LayerwiseKVOffload()
+    slot_ptrs = {cache._k.data_ptr() for cache in offloaded[:2]}
+    for cache in offloaded:
+        offload.add(cache)
+    assert not slot_ptrs & {cache._k.data_ptr() for cache in offloaded}
+
+    # Six chunks roll the window past the sink; two writes per chunk mimic
+    # denoising steps overwriting the same positions.
+    for chunk_idx in range(6):
+        offload.synchronize()
+        for cache in resident + offloaded:
+            cache.before_update(chunk_idx)
+        for _step in range(2):
+            for i in range(layers):
+                k, v = torch.randn(1, 2, 1, 2), torch.randn(1, 2, 1, 3)
+                offload.before_layer(offloaded, i)
+                assert offloaded[i]._k.data_ptr() in slot_ptrs
+                resident[i].update(k, v)
+                offloaded[i].update(k, v)
+                torch.testing.assert_close(
+                    offloaded[i].cached_k(), resident[i].cached_k()
+                )
+                torch.testing.assert_close(
+                    offloaded[i].cached_v(), resident[i].cached_v()
+                )
+                offload.after_layer(offloaded, i)
+        for cache in resident + offloaded:
+            cache.after_update(chunk_idx)
+
+    for ref, cache in zip(resident, offloaded, strict=True):
+        assert cache._k.data_ptr() not in slot_ptrs
+        visible = cache._seq_slice(0, cache.size)
+        torch.testing.assert_close(cache._k[visible], ref._k[visible])
+        torch.testing.assert_close(cache._v[visible], ref._v[visible])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA streams")
+@pytest.mark.ci_gpu
+def test_layerwise_offload_timing_reports_every_layer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("FLASHDREAMS_KV_OFFLOAD_TIMING", "1")
+    jsonl = tmp_path / "timing.jsonl"
+    monkeypatch.setenv("FLASHDREAMS_KV_OFFLOAD_TIMING_JSONL", str(jsonl))
+    caches = [
+        BlockKVCache(
+            k_shape=(1, 4096, 8, 64),
+            v_shape=(1, 4096, 8, 64),
+            seq_dim=1,
+            chunk_size=1024,
+            window_size=4096,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        for _ in range(3)
+    ]
+    offload = LayerwiseKVOffload()
+    for cache in caches:
+        offload.add(cache)
+    for cache in caches:
+        cache.before_update(0)
+    chunk = torch.randn(1, 1024, 8, 64, device="cuda", dtype=torch.bfloat16)
+    for i, cache in enumerate(caches):
+        offload.before_layer(caches, i)
+        cache.update(chunk, chunk)
+        _ = cache.cached_k().float().square().sum()  # stand-in compute
+        offload.after_layer(caches, i)
+    offload.synchronize()
+
+    (rows,) = offload.timings
+    assert [row["layer"] for row in rows] == [0, 1, 2]
+    for row in rows:
+        assert row["fetch_ms"] > 0 and row["compute_ms"] > 0
+        assert row["fetch_mb"] == pytest.approx(2 * 1024 * 8 * 64 * 2 / 1e6)
+    assert json.loads(jsonl.read_text()) == {"forward": 0, "layers": rows}
 
 
 @pytest.fixture

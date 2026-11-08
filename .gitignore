@@ -145,3 +145,7 @@ _vk_compare/
 imgui.ini
 
 # Generated from the canonical root LICENSES during integration builds.
+
+# Personal source-reading notes
+KVCache*阅读指南*.md
+KVCache*阅读指南*.html

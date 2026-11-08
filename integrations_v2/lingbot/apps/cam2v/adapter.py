@@ -18,6 +18,7 @@ from lingbot.config import (
     PIPELINE_LINGBOT_WORLD_FAST,
     PIPELINE_LINGBOT_WORLD_FAST_TAEHV_WINDOW15_SINK3,
     PIPELINE_LINGBOT_WORLD_V2_1P3B_CAUSAL_FAST_PERF,
+    PIPELINE_LINGBOT_WORLD_V2_1P3B_CAUSAL_FAST_PERF_FULLKV_OFFLOAD,
     PIPELINE_LINGBOT_WORLD_V2_1P3B_CAUSAL_FAST_PERF_TAEHV,
     PIPELINE_LINGBOT_WORLD_V2_14B_CAUSAL_FAST,
     PIPELINE_LINGBOT_WORLD_V2_14B_CAUSAL_FAST_TAEHV_WINDOW15_SINK3,
@@ -124,12 +125,20 @@ def create_app_v2_1p3b_causal_fast_perf_taehv() -> IApplication:
     )
 
 
+def create_app_v2_1p3b_causal_fast_perf_fullkv_offload() -> IApplication:
+    """Return the 1.3B full-KV application with layerwise host KV offload."""
+    return LingbotCam2VApplication(
+        pipeline_config=PIPELINE_LINGBOT_WORLD_V2_1P3B_CAUSAL_FAST_PERF_FULLKV_OFFLOAD
+    )
+
+
 __all__ = [
     "LingbotCam2VApplication",
     "create_app",
     "create_app_fast",
     "create_app_fast_taehv_window15_sink3",
     "create_app_v2_1p3b_causal_fast_perf",
+    "create_app_v2_1p3b_causal_fast_perf_fullkv_offload",
     "create_app_v2_1p3b_causal_fast_perf_taehv",
     "create_app_v2_14b_causal_fast",
     "create_app_v2_14b_causal_fast_taehv_window15_sink3",

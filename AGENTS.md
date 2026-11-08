@@ -35,6 +35,7 @@ FlashDreams is a GPU-heavy inference and serving library for autoregressive vide
 
 Start here, then use the narrower docs for the task in front of you:
 
+- `WORLDCACHE.md` holds the goal, status, and next steps of the WorldCache KV-serving work in this fork. Read it before any KV cache work.
 - `skills/` contains repo-authored Agent Skills. Use `skills/README.md` for opt-in setup and skill authoring rules.
 - `README.md` covers user-facing setup, requirements, supported models, and first-run commands.
 - `CONTRIBUTING.md` covers PR process, DCO sign-off, coding conventions, test markers, and dependency rules.

@@ -49,6 +49,9 @@ def test_package_registers_the_shared_cam2v_application() -> None:
         "cam2v-lingbot-world-v2-1p3b-causal-fast-perf-taehv": (
             f"{target}create_app_v2_1p3b_causal_fast_perf_taehv"
         ),
+        "cam2v-lingbot-world-v2-1p3b-causal-fast-perf-fullkv-offload": (
+            f"{target}create_app_v2_1p3b_causal_fast_perf_fullkv_offload"
+        ),
         "cam2v-lingbot-world-v2-14b-causal-fast": (
             f"{target}create_app_v2_14b_causal_fast"
         ),

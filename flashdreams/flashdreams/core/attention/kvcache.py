@@ -5,11 +5,16 @@
 
 from __future__ import annotations
 
+import json
+import os
+import statistics
 from collections.abc import Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from itertools import pairwise
 
 import torch
+from loguru import logger
 from torch import Tensor
 from typing_extensions import Self
 
@@ -880,10 +885,222 @@ class BlockKVCache:
         self._v.copy_(v)
 
 
+class LayerwiseKVOffload:
+    """Keep ``BlockKVCache`` layers in host memory and stream them through two device slots.
+
+    Every added cache keeps its K/V home in pinned host memory. While layer
+    ``i`` computes, layer ``i + 1`` is copied into the other device slot on a
+    side stream; once layer ``i`` finishes, only its current write range is
+    copied back home. Device K/V residency is two layers regardless of depth,
+    and one offload can be shared by several network caches (e.g. CFG cond and
+    uncond) because they run one after another.
+
+    Per-forward usage (each cache must already be between ``before_update``
+    and ``after_update``)::
+
+        for i, block in enumerate(blocks):
+            offload.before_layer(caches, i)
+            x = block(x, caches[i])
+            offload.after_layer(caches, i)
+
+    Host-side cache mutation (the ``before_update`` window roll) must call
+    :meth:`synchronize` first. Slot rebinding and side-stream copies are not
+    CUDA-graph compatible.
+
+    ``FLASHDREAMS_KV_OFFLOAD_TIMING=1`` records CUDA events around each layer's
+    fetch, compute, and write-back. :meth:`synchronize` then logs one summary
+    per forward and appends per-layer rows to :attr:`timings`;
+    ``FLASHDREAMS_KV_OFFLOAD_TIMING_JSONL=<path>`` also appends each forward's
+    rows to that file as one JSON line.
+    """
+
+    def __init__(self) -> None:
+        self._slots: list[LayerKV] = []
+        self._ready: list[torch.cuda.Event] = []
+        self._home: dict[int, LayerKV] = {}
+        self._stream: torch.cuda.Stream | None = None
+        self._timing = os.environ.get("FLASHDREAMS_KV_OFFLOAD_TIMING") == "1"
+        self._events: dict[int, dict[str, torch.cuda.Event | int]] = {}
+        self._pending: list[dict[int, dict[str, torch.cuda.Event | int]]] = []
+        self.timings: list[list[dict[str, float]]] = []
+        """Per forward, per layer: ``fetch_ms``, ``stall_ms``, ``compute_ms``,
+        ``writeback_ms``, ``fetch_mb``. Filled only when timing is enabled."""
+
+    def add(self, cache: BlockKVCache) -> None:
+        """Move ``cache`` storage home to host; the first two device buffers become slots.
+
+        Call right after each cache is built so peak device memory stays at a
+        few layers instead of the whole network.
+        """
+        if len(self._slots) < 2:
+            # Reusing the cache's own buffers keeps any custom layout the
+            # model chose (e.g. Lingbot's TMA-padded values).
+            self._slots.append((cache._k, cache._v))
+            if cache._k.device.type == "cuda":
+                self._stream = self._stream or torch.cuda.Stream(cache._k.device)
+                self._ready.append(torch.cuda.Event())
+        elif cache._k.shape != self._slots[0][0].shape:
+            raise ValueError(
+                f"offloaded layers need one K/V shape; got {tuple(cache._k.shape)}, "
+                f"slots hold {tuple(self._slots[0][0].shape)}."
+            )
+        pin = self._stream is not None
+        home = (
+            torch.empty(cache.k_shape, dtype=cache.dtype, pin_memory=pin),
+            torch.empty(cache.v_shape, dtype=cache.dtype, pin_memory=pin),
+        )
+        self._home[id(cache)] = home
+        cache._k, cache._v = home
+
+    def synchronize(self) -> None:
+        """Wait for pending copies so host homes are safe to read or mutate."""
+        if self._stream is not None:
+            # The last write-back waits on the last compute, so every recorded
+            # event of finished forwards is complete after this.
+            self._stream.synchronize()
+        for events in self._pending:
+            self._log_forward(events)
+        self._pending.clear()
+
+    @torch.compiler.disable
+    def before_layer(self, caches: Sequence[BlockKVCache], index: int) -> None:
+        """Prefetch the next layer and bind ``caches[index]`` to its device slot."""
+        if index == 0:
+            self._prefetch(caches, 0)
+        if index + 1 < len(caches):
+            # The target slot last held layer ``index - 1``; its write-back was
+            # queued earlier on the same in-order side stream.
+            self._prefetch(caches, index + 1)
+        slot = index % 2
+        if self._stream is not None:
+            torch.cuda.current_stream().wait_event(self._ready[slot])
+            if self._timing:
+                # Recorded after the wait, so it marks when compute can start.
+                self._events[index]["compute_start"] = self._record()
+        caches[index]._k, caches[index]._v = self._slots[slot]
+
+    @torch.compiler.disable
+    def after_layer(self, caches: Sequence[BlockKVCache], index: int) -> None:
+        """Write the layer's current chunk back home and rebind the cache to it."""
+        cache = caches[index]
+        home_k, home_v = self._home[id(cache)]
+        write = cache._seq_slice(*cache._current_write_bounds())
+        timed = self._timing and self._stream is not None
+        if timed:
+            self._events[index]["compute_end"] = self._record()
+        if self._stream is not None:
+            self._stream.wait_stream(torch.cuda.current_stream())
+        with self._side_stream():
+            if timed:
+                self._events[index]["writeback_start"] = self._record(self._stream)
+            home_k[write].copy_(cache._k[write], non_blocking=True)
+            home_v[write].copy_(cache._v[write], non_blocking=True)
+            if timed:
+                self._events[index]["writeback_end"] = self._record(self._stream)
+        cache._k, cache._v = home_k, home_v
+        if timed and index == len(caches) - 1:
+            self._pending.append(self._events)
+            self._events = {}
+
+    def _side_stream(self) -> AbstractContextManager[object]:
+        if self._stream is None:
+            return nullcontext()
+        return torch.cuda.stream(self._stream)
+
+    def _prefetch(self, caches: Sequence[BlockKVCache], index: int) -> None:
+        # ponytail: copies the whole visible prefix, including the chunk this
+        # forward overwrites, and re-copies unchanged history on every
+        # denoising step; skip the write range or cache history across steps
+        # if H2D bandwidth dominates.
+        cache = caches[index]
+        slot = index % 2
+        visible = cache._seq_slice(0, cache.size)
+        slot_k, slot_v = self._slots[slot]
+        with self._side_stream():
+            timed = self._timing and self._stream is not None
+            if timed:
+                fetch_start = self._record(self._stream)
+            slot_k[visible].copy_(cache._k[visible], non_blocking=True)
+            slot_v[visible].copy_(cache._v[visible], non_blocking=True)
+            if self._stream is not None:
+                self._ready[slot].record(self._stream)
+            if timed:
+                nbytes = sum(
+                    t[visible].numel() * t.element_size() for t in (cache._k, cache._v)
+                )
+                self._events[index] = {
+                    "fetch_start": fetch_start,
+                    "fetch_end": self._record(self._stream),
+                    "fetch_bytes": nbytes,
+                }
+
+    @staticmethod
+    def _record(stream: torch.cuda.Stream | None = None) -> torch.cuda.Event:
+        event = torch.cuda.Event(enable_timing=True)
+        event.record(stream)
+        return event
+
+    def _log_forward(
+        self, events: dict[int, dict[str, torch.cuda.Event | int]]
+    ) -> None:
+        rows: list[dict[str, float]] = []
+        for index in sorted(events):
+            layer = events[index]
+            ms = {
+                name: layer[f"{name}_start"].elapsed_time(layer[f"{name}_end"])  # type: ignore[union-attr]
+                for name in ("fetch", "compute", "writeback")
+            }
+            # Gap between the previous layer's compute and this one's: time the
+            # compute stream sat waiting for this fetch (plus hook launch cost).
+            # Layer 0 has nothing to overlap with, so its whole fetch is exposed.
+            stall = (
+                events[index - 1]["compute_end"].elapsed_time(layer["compute_start"])  # type: ignore[union-attr]
+                if index > 0
+                else ms["fetch"]
+            )
+            rows.append(
+                {
+                    "layer": index,
+                    "fetch_ms": ms["fetch"],
+                    "stall_ms": stall,
+                    "compute_ms": ms["compute"],
+                    "writeback_ms": ms["writeback"],
+                    "fetch_mb": int(layer["fetch_bytes"]) / 1e6,
+                }
+            )
+        self.timings.append(rows)
+        jsonl = os.environ.get("FLASHDREAMS_KV_OFFLOAD_TIMING_JSONL")
+        if jsonl:
+            with open(jsonl, "a") as file:
+                file.write(
+                    json.dumps({"forward": len(self.timings) - 1, "layers": rows})
+                )
+                file.write("\n")
+        fetch = [row["fetch_ms"] for row in rows]
+        compute = [row["compute_ms"] for row in rows]
+        fetch_gb = sum(row["fetch_mb"] for row in rows) / 1e3
+        logger.info(
+            "kv_offload forward {}: {} layers | per-layer fetch median {:.2f} ms "
+            "(max {:.2f}), compute median {:.2f} ms (max {:.2f}), writeback "
+            "median {:.3f} ms | stall total {:.2f} ms | H2D {:.2f} GB @ {:.1f} GB/s",
+            len(self.timings) - 1,
+            len(rows),
+            statistics.median(fetch),
+            max(fetch),
+            statistics.median(compute),
+            max(compute),
+            statistics.median(row["writeback_ms"] for row in rows),
+            sum(row["stall_ms"] for row in rows),
+            fetch_gb,
+            fetch_gb / (sum(fetch) / 1e3),
+        )
+
+
 __all__ = [
     "BlockKVCache",
     "FixedSlotKVCache",
     "LayerKV",
+    "LayerwiseKVOffload",
     "SlotRegion",
     "TokenWindow",
 ]

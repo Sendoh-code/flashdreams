@@ -201,6 +201,21 @@ PIPELINE_LINGBOT_WORLD_V2_1P3B_CAUSAL_FAST_PERF_TAEHV = derive_config(
 )
 """RTX 5090 performance preset using SageAttention with TAEHV decoding."""
 
+PIPELINE_LINGBOT_WORLD_V2_1P3B_CAUSAL_FAST_PERF_FULLKV_OFFLOAD = derive_config(
+    PIPELINE_LINGBOT_WORLD_V2_1P3B_CAUSAL_FAST_PERF,
+    name="lingbot-world-v2-1p3b-causal-fast-perf-fullkv-offload",
+    diffusion_model=dict(
+        transformer=dict(
+            # Full KV: the window holds every chunk of the 20-chunk
+            # (``reference_noise_steps``) rollout at ``len_t=4``.
+            window_size_t=80,
+            sink_size_t=0,
+            kv_offload=True,
+        ),
+    ),
+)
+"""Full-history KV kept in pinned host memory, two layers resident on GPU."""
+
 PIPELINE_CONFIGS: dict[str, LingbotWorldInferencePipelineConfig] = {
     cfg.name: cfg
     for cfg in (
@@ -210,6 +225,7 @@ PIPELINE_CONFIGS: dict[str, LingbotWorldInferencePipelineConfig] = {
         PIPELINE_LINGBOT_WORLD_V2_14B_CAUSAL_FAST_TAEHV_WINDOW15_SINK3,
         PIPELINE_LINGBOT_WORLD_V2_1P3B_CAUSAL_FAST_PERF,
         PIPELINE_LINGBOT_WORLD_V2_1P3B_CAUSAL_FAST_PERF_TAEHV,
+        PIPELINE_LINGBOT_WORLD_V2_1P3B_CAUSAL_FAST_PERF_FULLKV_OFFLOAD,
     )
 }
 """All shipped LingBot-World pipeline configs, keyed by ``name``."""

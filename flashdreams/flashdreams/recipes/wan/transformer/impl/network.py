@@ -14,6 +14,7 @@ from einops import rearrange
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
+from flashdreams.core.attention import LayerwiseKVOffload
 from flashdreams.core.distributed.context_parallel import (
     cat_outputs_cp,
     split_inputs_cp,
@@ -35,12 +36,18 @@ class WanDiTNetworkCache:
     block_caches: list[BlockCache]
     """Per-transformer-block KV cache, indexed by block position."""
 
+    kv_offload: LayerwiseKVOffload | None = None
+    """Host offload streaming self-attention K/V through two device slots; ``None`` keeps K/V resident."""
+
     def __getitem__(self, index: int) -> BlockCache:
         """Get cache for a specific block."""
         return self.block_caches[index]
 
     def before_update(self, chunk_idx: int) -> None:
         """Run pre-update hooks for all block caches."""
+        if self.kv_offload is not None:
+            # The window roll mutates host homes still targeted by async copies.
+            self.kv_offload.synchronize()
         for block_cache in self.block_caches:
             block_cache.before_update(chunk_idx)
 
@@ -318,6 +325,7 @@ class WanDiTNetwork(nn.Module):
         sink_size: int,
         text_embeddings: Tensor,
         img_embeddings: Tensor | None = None,
+        kv_offload: LayerwiseKVOffload | None = None,
     ) -> WanDiTNetworkCache:
         """Initialize block caches from text/image context embeddings.
 
@@ -327,6 +335,8 @@ class WanDiTNetwork(nn.Module):
             sink_size: Sink-token capacity preserved across updates.
             text_embeddings: Text embeddings. UMT5 has shape [..., 512, 4096].
             img_embeddings: Optional image embeddings for I2V. CLIP has shape [..., 256, 1280].
+            kv_offload: Optional host offload; each block's self-attention cache
+                moves home as soon as it is built.
 
         Returns:
             ``WanDiTNetworkCache`` containing per-block caches.
@@ -344,12 +354,13 @@ class WanDiTNetwork(nn.Module):
         block_caches: list[BlockCache] = []
         for block in self.blocks:
             assert isinstance(block, Block)
-            block_caches.append(
-                block.initialize_cache(
-                    chunk_size, window_size, sink_size, context_text, context_img
-                )
+            block_cache = block.initialize_cache(
+                chunk_size, window_size, sink_size, context_text, context_img
             )
-        return WanDiTNetworkCache(block_caches=block_caches)
+            if kv_offload is not None:
+                kv_offload.add(block_cache.self_attn)
+            block_caches.append(block_cache)
+        return WanDiTNetworkCache(block_caches=block_caches, kv_offload=kv_offload)
 
     def update_parameters_after_loading_checkpoint(self) -> None:
         """Fuse load-time-known ops into weights; call once after loading the checkpoint."""
@@ -506,8 +517,13 @@ class WanDiTNetwork(nn.Module):
         # Transformer blocks
         if eager_mode:
             cache.before_update(current_chunk_idx)
+        offload = cache.kv_offload
+        if offload is not None:
+            self_attn_caches = [c.self_attn for c in cache.block_caches]
         for block_idx, block in enumerate(self.blocks):
             assert isinstance(block, Block)
+            if offload is not None:
+                offload.before_layer(self_attn_caches, block_idx)
             x = block(
                 x=x,
                 e=block_e,
@@ -515,6 +531,8 @@ class WanDiTNetwork(nn.Module):
                 cache=cache[block_idx],
                 **block_extra_kwargs,
             )
+            if offload is not None:
+                offload.after_layer(self_attn_caches, block_idx)
         if eager_mode:
             cache.after_update(current_chunk_idx)
 
