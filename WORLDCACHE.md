@@ -79,6 +79,17 @@ building one is the main refactor toward the goal.
   resident caches) and `test_layerwise_offload_timing_reports_every_layer`
   (`ci_gpu`).
 
+### A40 H2D crossover experiment (in progress)
+
+- Question: at what visible KV length V does per-layer fetch exceed per-layer
+  compute on A40 48GB (Delta `gpuA40x4`)?
+- `lingbot.apps.cam2v.kv_sweep`: bf16 1.3B app (sm86 has no FP8, so
+  `torch` linears + `wan` attention) with `KV_SWEEP_WINDOW_T`,
+  `KV_SWEEP_SINK_T`, `KV_SWEEP_OFFLOAD` from the environment.
+- `experiments/kv_offload/`: `h2d_bench.py` (pinned copy GB/s at layer sizes),
+  `sweep.slurm` (window × resident/offload matrix, NUMA-bound, serial),
+  `analyze.py` (CSV + fitted crossover V*; `--self-check`).
+
 ### Known gaps
 
 - Tests have not been run yet (the original machine had `uv` < 0.11.8).
