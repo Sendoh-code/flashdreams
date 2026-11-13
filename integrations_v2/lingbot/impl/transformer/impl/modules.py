@@ -136,12 +136,14 @@ class OptimizedSelfAttention(SelfAttention):
         *,
         attention_backend: Literal["fp8_tma", "scaled_fp8", "sage"] = "scaled_fp8",
         use_tma: bool = True,
+        apply_rope_before_kvcache: bool = True,
     ) -> None:
         super().__init__(
             query_dim=dim,
             n_heads=n_heads,
             head_dim=dim // n_heads,
             eps=eps,
+            apply_rope_before_kvcache=apply_rope_before_kvcache,
         )
         self.attention_backend = attention_backend
         self.use_tma = use_tma
@@ -210,11 +212,17 @@ class OptimizedSelfAttention(SelfAttention):
         q = self.norm_q(q).reshape(head_shape)
         k = self.norm_k(k).reshape(head_shape)
         v = v.reshape(head_shape)
-        q = apply_rope_freqs(q, rope_freqs, interleaved=True)
-        k = apply_rope_freqs(k, rope_freqs, interleaved=True)
+        rope_q, rope_k = self._slice_rope_freqs(rope_freqs, kv_cache)
+        assert rope_q is not None and rope_k is not None
+        q = apply_rope_freqs(q, rope_q, interleaved=True)
+        if self.apply_rope_before_kvcache:
+            k = apply_rope_freqs(k, rope_k, interleaved=True)
         kv_cache.update(k, v)
+        key = kv_cache.cached_k()
+        if not self.apply_rope_before_kvcache:
+            # Cache holds un-rotated K; rotate a copy by cache-slot position.
+            key = apply_rope_freqs(key.clone(), rope_k, interleaved=True)
         if self.attention_backend == "sage":
-            key = kv_cache.cached_k()
             key_mean = None
             if key_history_sum is not None:
                 key_mean = (
@@ -227,14 +235,14 @@ class OptimizedSelfAttention(SelfAttention):
         elif self.attention_backend == "fp8_tma":
             output = _call_fp8_attention(
                 q,
-                kv_cache.cached_k(),
+                key,
                 kv_cache.cached_v(),
                 use_tma=self.use_tma,
             )
         else:
             output = scaled_fp8_attention(
                 q,
-                kv_cache.cached_k(),
+                key,
                 kv_cache.cached_v(),
                 output_dtype=q.dtype,
                 use_tma=self.use_tma,
@@ -299,6 +307,7 @@ class CamCtrlBlock(Block):
         cp_method: Literal["ring", "ulysses"] = "ring",
         self_attention_backend: Literal["wan", "fp8_tma", "scaled_fp8", "sage"] = "wan",
         self_attention_use_tma: bool = True,
+        apply_rope_before_kvcache: bool = True,
     ) -> None:
         super().__init__(
             dim=dim,
@@ -306,6 +315,7 @@ class CamCtrlBlock(Block):
             num_heads=num_heads,
             cross_attn_norm=cross_attn_norm,
             eps=eps,
+            apply_rope_before_kvcache=apply_rope_before_kvcache,
             cp_method=cp_method,
         )
         if self_attention_backend != "wan":
@@ -315,6 +325,7 @@ class CamCtrlBlock(Block):
                 eps,
                 attention_backend=self_attention_backend,
                 use_tma=self_attention_use_tma,
+                apply_rope_before_kvcache=apply_rope_before_kvcache,
             )
         # The checkpoint's Wan implementation uses an explicit FP32 square/mean
         # reduction, rounds the normalized values back to the activation dtype,
@@ -366,6 +377,8 @@ class CamCtrlBlock(Block):
                 isinstance(self.self_attn, OptimizedSelfAttention)
                 and self.self_attn.attention_backend == "sage"
                 and window_size >= chunk_size
+                # The reused sum is of cached K, which is un-rotated pre-RoPE.
+                and self.self_attn.apply_rope_before_kvcache
             ),
         )
 

@@ -15,6 +15,13 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 import torch
 
+from flashdreams.core.attention.kvbank import (
+    CameraPoseRetrieval,
+    KVBank,
+    KVBankConfig,
+    KVBankEntry,
+    KVRetrievalPolicy,
+)
 from flashdreams.core.attention.kvcache import BlockKVCache, LayerwiseKVOffload
 from flashdreams.core.attention.rope import (
     KVCacheRelativeRotaryPositionEmbedding3D,
@@ -224,6 +231,131 @@ def test_layerwise_offload_matches_resident_caches() -> None:
         visible = cache._seq_slice(0, cache.size)
         torch.testing.assert_close(cache._k[visible], ref._k[visible])
         torch.testing.assert_close(cache._v[visible], ref._v[visible])
+
+
+class _MatchAction(KVRetrievalPolicy):
+    """Test policy: newest candidates whose action equals the query's last one."""
+
+    def select(
+        self,
+        bank: KVBank,
+        query: KVBankEntry,
+        candidates: list[KVBankEntry],
+        k: int,
+    ) -> list[KVBankEntry]:
+        want = int(query.meta["action"][-1])
+        return [c for c in candidates if int(c.meta["action"][-1]) == want][-k:]
+
+
+@pytest.mark.ci_cpu
+@pytest.mark.parametrize("granularity", ["chunk", "frame"])
+@pytest.mark.parametrize("capacity", [None, 2])
+def test_kv_bank_fills_retrieve_region(granularity: str, capacity: int | None) -> None:
+    """Attended K is ``[sink | policy-picked bank entries | window]`` under FIFO budget."""
+    _check_kv_bank(granularity, capacity, "cpu")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA streams")
+@pytest.mark.ci_gpu
+@pytest.mark.parametrize("granularity", ["chunk", "frame"])
+@pytest.mark.parametrize("capacity", [None, 2])
+def test_kv_bank_fills_retrieve_region_cuda(granularity: str, capacity: int | None) -> None:
+    """Same as the CPU check, with async side-stream fetch/store and pinned host storage."""
+    _check_kv_bank(granularity, capacity, "cuda")
+
+
+def _check_kv_bank(granularity: str, capacity: int | None, device: str) -> None:
+    F, sink, retrieve, window, layers = 2, 2, 2, 4, 3  # frames; 1 token per frame
+    entry = F if granularity == "chunk" else 1
+    k_entries = retrieve // entry
+    # One entry is ``entry`` tokens of K (2 ch) + V (3 ch) float32 per layer.
+    entry_bytes = layers * entry * (2 + 3) * 4
+    budget = (capacity or 1000) * entry_bytes / 1e9
+    bank = KVBank(
+        KVBankConfig(
+            budget_gb=budget,
+            granularity=granularity,  # type: ignore[arg-type]
+            retrieve_size_t=retrieve,
+            policy=_MatchAction(),
+        ),
+        frames_per_chunk=F,
+        sink_frames=sink,
+        window_frames=window,
+    )
+    offload = LayerwiseKVOffload(bank=bank)
+    caches = [
+        BlockKVCache(
+            k_shape=(1, sink + retrieve + window, 1, 2),
+            v_shape=(1, sink + retrieve + window, 1, 3),
+            seq_dim=1,
+            chunk_size=F,
+            window_size=window,
+            sink_size=sink + retrieve,
+            device=device,
+            dtype=torch.float32,
+        )
+        for _ in range(layers)
+    ]
+    for cache in caches:
+        offload.add(cache)
+
+    def action(f: int) -> int:
+        return f % 3
+
+    stored: list[int] = []  # first frames of stored entries, FIFO-evicted
+    for c in range(10):
+        frames = list(range(c * F, (c + 1) * F))
+        offload.begin_chunk(c)
+        for cache in caches:
+            cache.before_update(c)
+        bank.annotate(c, per_frame={"action": torch.tensor([action(f) for f in frames])})
+        stored += [f for f in frames[::entry] if f >= sink]
+        stored = stored[-capacity:] if capacity else stored
+
+        # Independent model of the expected window.
+        window_frames = list(range(max(sink + retrieve, frames[-1] + 1 - window), frames[-1] + 1))
+        memory = list(range(sink, sink + retrieve))  # host home's copy
+        if frames[0] >= sink + retrieve:
+            picked = [
+                f for f in stored
+                if f + entry <= window_frames[0] and action(f + entry - 1) == action(frames[-1])
+            ][-k_entries:]
+            got = [f + i for f in picked for i in range(entry)]
+            memory = got + memory[len(got):]
+        expected = list(range(sink)) + memory + window_frames
+        if frames[0] < sink + retrieve:  # still filling the sink region
+            expected = list(range(frames[-1] + 1))
+
+        for _step in range(2):
+            for i, cache in enumerate(caches):
+                offload.before_layer(caches, i)
+                k = torch.tensor(frames, dtype=torch.float32, device=device).view(1, F, 1, 1) + 100 * i
+                cache.update(k.expand(1, F, 1, 2), (k + 0.5).expand(1, F, 1, 3))
+                seen = cache.cached_k()[0, :, 0, 0] - 100 * i
+                assert seen.tolist() == expected, (c, i, seen.tolist(), expected)
+                torch.testing.assert_close(cache.cached_v()[0, :, 0, 0] - 100 * i, seen + 0.5)
+                offload.after_layer(caches, i)
+        for cache in caches:
+            cache.after_update(c)
+
+    assert [e.frame for e in bank.entries] == stored
+    offload.reset()
+    assert bank.entries == [] and len(bank._free) == bank.capacity
+
+
+@pytest.mark.ci_cpu
+def test_camera_pose_retrieval_picks_nearest_pose() -> None:
+    def entry(x: float, yaw_deg: float, frame: int) -> KVBankEntry:
+        pose = torch.eye(4)
+        a = torch.tensor(yaw_deg).deg2rad()
+        pose[0, 0], pose[0, 2], pose[2, 0], pose[2, 2] = a.cos(), a.sin(), -a.sin(), a.cos()
+        pose[0, 3] = x
+        return KVBankEntry(chunk_idx=frame, frame=frame, num_frames=1, meta={"poses": pose[None]})
+
+    candidates = [entry(0.0, 0.0, 0), entry(5.0, 90.0, 1), entry(0.1, 10.0, 2), entry(4.0, 80.0, 3)]
+    query = entry(0.0, 5.0, 9)
+    picked = CameraPoseRetrieval().select(cast(KVBank, None), query, candidates, 2)
+    assert sorted(e.frame for e in picked) == [0, 2]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA streams")

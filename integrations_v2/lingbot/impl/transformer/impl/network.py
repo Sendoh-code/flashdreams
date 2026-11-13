@@ -187,6 +187,7 @@ class LingbotWorldDiTNetwork(WanDiTNetwork):
             cp_method=self.cp_method,
             self_attention_backend=self.self_attention_backend,
             self_attention_use_tma=self.self_attention_use_tma,
+            apply_rope_before_kvcache=self.apply_rope_before_kvcache,
         )
 
     @torch.no_grad()

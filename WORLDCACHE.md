@@ -2,7 +2,8 @@
 
 Working notes for the WorldCache fork of FlashDreams. Read this first when
 resuming the work on a new machine or in a new agent session. Update the
-**Status** and **Next Steps** sections whenever they change.
+**Status** and **Next Steps** sections whenever they change. File/line map of
+every implemented component: `WORLDCACHE_IMPL.md` (update it with each change).
 
 ## Goal
 
@@ -89,15 +90,61 @@ building one is the main refactor toward the goal.
 - `experiments/kv_offload/`: `h2d_bench.py` (pinned copy GB/s at layer sizes),
   `sweep.slurm` (window × resident/offload matrix, NUMA-bound, serial),
   `analyze.py` (CSV + fitted crossover V*; `--self-check`).
+- Results so far (job 23683973, 2026-11-09, outputs under
+  `/work/nvme/bicu/ytian6/kv_offload/23683973/`):
+  - Pinned H2D 24.5 GB/s, D2H 26.3 GB/s (NUMA-bound, flat from 1 to 40 frames).
+  - F20 (W=80) and F40 (W=160): every resident run OOMs on 48 GB; F40 offload
+    runs were host-OOM-killed (exit137, ~44 GB pinned K/V vs `--mem`).
+  - Only data point: F20 offload-timed at V=40, fetch 9.06 ms/layer vs
+    compute 19.2 ms/layer, stall 9.2 ms/forward. Single window → V* fit is
+    meaningless (reported ∞).
+  - Next: rerun with smaller windows (e.g. W=20/40/60) that fit resident so
+    there is a baseline, and raise `--mem` for large offload windows.
+
+### KV bank + pre/post-RoPE option (implemented, validating)
+
+- `core/attention/kvbank.py`: budgeted pinned-host `KVBank` with per-entry
+  metadata (chunk or frame granularity), FIFO eviction, pluggable
+  `KVRetrievalPolicy` (`RecentRetrieval`, `CameraPoseRetrieval`). Fed through
+  `LayerwiseKVOffload(bank=...)`; attended layout `[sink | retrieved | window]`.
+  Config: `Wan21TransformerConfig.kv_bank` (needs `kv_offload`).
+- RoPE: `network.apply_rope_before_kvcache` now also works for LingBot.
+  Post-RoPE keeps retrieved entries at their original positions; pre-RoPE
+  places them at their retrieve slots.
+- GPU validation job: `experiments/kv_offload/bank_test.slurm`
+  (`sbatch` from the repo root; summary in `$SWEEP_ROOT/bank-<jobid>/summary.txt`).
+  - Job 23840663 (2026-11-13): `ci_cpu` 2 failed —
+    `test_kv_bank_fills_retrieve_region[2-chunk|2-frame]` raise
+    `kv bank budget ... holds 1 entries; one chunk needs 2` (test budget vs
+    the `kvbank.py` capacity check; unresolved). `ci_gpu` showed `..FF.Fs`
+    but the log and all 5 generation runs died with `Errno 122` because the
+    shared `/work/nvme/bicu` quota (550 GB hard) was full.
+  - Freed 120 GB and resubmitted unchanged as job 23900078; check its
+    `experiments/kv_offload/logs/kv-bank-test-23900078.out`.
+- Reference implementation: WorldKV (`git clone
+  git@github.com:cvlab-kaist/WorldKV.git WorldKV && git -C WorldKV checkout
+  046f6d1`, gitignored). `CameraPoseRetrieval` mirrors its
+  `image2video_fast.py`.
+- File/line map: `WORLDCACHE_IMPL.md` §3–§5.
 
 ### Known gaps
 
-- Tests have not been run yet (the original machine had `uv` < 0.11.8).
-- No GPU end-to-end run, no quality parity vs resident KV, no perf numbers.
+- `ci_cpu` KV tests run on Delta; 2 bank tests fail (see above). GPU tests
+  and the end-to-end bank runs have no clean result yet.
+- No quality parity vs resident KV, no perf numbers beyond the one sweep point.
 - H2D-bandwidth bound: each prefetch re-copies the whole visible prefix on
   every denoising step (marked `ponytail:` in `_prefetch`).
 - Not CUDA-graph compatible (slot rebinding + side stream).
 - Covers only `BlockKVCache` in the Wan recipe; not a general policy interface.
+
+## Resuming On A New Machine
+
+1. Read this file, then `WORLDCACHE_IMPL.md` (file/line map; keep it updated
+   with every KV change and bump its baseline commit).
+2. Clone WorldKV as above if you need the reference code.
+3. Slurm scripts hard-code Delta paths (`/work/nvme/bicu/ytian6`,
+   account `bicu-delta-gpu`); override `SWEEP_ROOT`/`HF_HOME` elsewhere.
+4. Watch the group quota (`quota`): `/work/nvme/bicu` is shared and was full.
 
 ## Next Steps
 

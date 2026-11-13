@@ -47,7 +47,7 @@ class WanDiTNetworkCache:
         """Run pre-update hooks for all block caches."""
         if self.kv_offload is not None:
             # The window roll mutates host homes still targeted by async copies.
-            self.kv_offload.synchronize()
+            self.kv_offload.begin_chunk(chunk_idx)
         for block_cache in self.block_caches:
             block_cache.before_update(chunk_idx)
 
@@ -58,6 +58,8 @@ class WanDiTNetworkCache:
 
     def reset(self) -> None:
         """Reset self-attention bookkeeping without reallocating KV buffers."""
+        if self.kv_offload is not None:
+            self.kv_offload.reset()
         for block_cache in self.block_caches:
             block_cache.self_attn.reset()
 

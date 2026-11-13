@@ -12,11 +12,15 @@ from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from itertools import pairwise
+from typing import TYPE_CHECKING
 
 import torch
 from loguru import logger
 from torch import Tensor
 from typing_extensions import Self
+
+if TYPE_CHECKING:
+    from flashdreams.core.attention.kvbank import KVBank
 
 LayerKV = tuple[Tensor, Tensor]
 """Key/value tensors for one attention layer."""
@@ -912,9 +916,16 @@ class LayerwiseKVOffload:
     per forward and appends per-layer rows to :attr:`timings`;
     ``FLASHDREAMS_KV_OFFLOAD_TIMING_JSONL=<path>`` also appends each forward's
     rows to that file as one JSON line.
+
+    With a :class:`~flashdreams.core.attention.kvbank.KVBank`, every written
+    chunk is also stored in the bank, and each prefetch fills the cache's
+    retrieve region (the sink tail) with the entries the bank's retrieval
+    policy picked instead of the host home's copy.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, bank: KVBank | None = None) -> None:
+        self.bank = bank
+        """Optional metadata-indexed store feeding the retrieve region."""
         self._slots: list[LayerKV] = []
         self._ready: list[torch.cuda.Event] = []
         self._home: dict[int, LayerKV] = {}
@@ -951,6 +962,8 @@ class LayerwiseKVOffload:
         )
         self._home[id(cache)] = home
         cache._k, cache._v = home
+        if self.bank is not None:
+            self.bank.add(cache)
 
     def synchronize(self) -> None:
         """Wait for pending copies so host homes are safe to read or mutate."""
@@ -961,6 +974,18 @@ class LayerwiseKVOffload:
         for events in self._pending:
             self._log_forward(events)
         self._pending.clear()
+
+    def begin_chunk(self, chunk_idx: int) -> None:
+        """Synchronize, then let the bank allocate entries for ``chunk_idx``."""
+        self.synchronize()
+        if self.bank is not None:
+            self.bank.begin_chunk(chunk_idx)
+
+    def reset(self) -> None:
+        """Forget per-rollout state (bank entries); buffers stay allocated."""
+        self.synchronize()
+        if self.bank is not None:
+            self.bank.reset()
 
     @torch.compiler.disable
     def before_layer(self, caches: Sequence[BlockKVCache], index: int) -> None:
@@ -995,6 +1020,10 @@ class LayerwiseKVOffload:
                 self._events[index]["writeback_start"] = self._record(self._stream)
             home_k[write].copy_(cache._k[write], non_blocking=True)
             home_v[write].copy_(cache._v[write], non_blocking=True)
+            if self.bank is not None:
+                # Every denoising step overwrites the same rows; the last wins.
+                for dst, src in self.bank.store(cache):
+                    dst.copy_(src, non_blocking=True)
             if timed:
                 self._events[index]["writeback_end"] = self._record(self._stream)
         cache._k, cache._v = home_k, home_v
@@ -1014,20 +1043,31 @@ class LayerwiseKVOffload:
         # if H2D bandwidth dominates.
         cache = caches[index]
         slot = index % 2
-        visible = cache._seq_slice(0, cache.size)
         slot_k, slot_v = self._slots[slot]
+        bank = self.bank
+        retrieved = bank.fetch(cache, slot_k, slot_v) if bank is not None else []
+        if retrieved:
+            # Bank entries replace home's copy of the retrieve region.
+            assert bank is not None
+            start = bank.memory_start(cache)
+            filled = len(retrieved) // 2 * bank.entry_tokens(cache)
+            spans = [(0, start), (start + filled, cache.size)]
+        else:
+            spans = [(0, cache.size)]
+        copies = list(retrieved)
+        for begin, end in spans:
+            region = cache._seq_slice(begin, end)
+            copies += [(slot_k[region], cache._k[region]), (slot_v[region], cache._v[region])]
         with self._side_stream():
             timed = self._timing and self._stream is not None
             if timed:
                 fetch_start = self._record(self._stream)
-            slot_k[visible].copy_(cache._k[visible], non_blocking=True)
-            slot_v[visible].copy_(cache._v[visible], non_blocking=True)
+            for dst, src in copies:
+                dst.copy_(src, non_blocking=True)
             if self._stream is not None:
                 self._ready[slot].record(self._stream)
             if timed:
-                nbytes = sum(
-                    t[visible].numel() * t.element_size() for t in (cache._k, cache._v)
-                )
+                nbytes = sum(src.numel() * src.element_size() for _, src in copies)
                 self._events[index] = {
                     "fetch_start": fetch_start,
                     "fetch_end": self._record(self._stream),

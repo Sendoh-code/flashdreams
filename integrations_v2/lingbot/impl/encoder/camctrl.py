@@ -73,6 +73,10 @@ class I2VCamCtrlEmbeddings:
     """Plücker pixel volume of shape ``[..., T, 6 * 64, H/8, W/8]`` after the
     inline 8x8 spatial unshuffle."""
 
+    poses: Tensor | None = None
+    """Absolute camera-to-world pose of each latent frame, ``[..., T, 4, 4]``
+    (metadata for KV-bank retrieval)."""
+
     _is_patchified: bool = False
     """``True`` once the consuming transformer has patchified this payload in place."""
 
@@ -177,7 +181,7 @@ class I2VCamCtrlEncoder(StreamingVideoEncoder[I2VCamCtrlEncoderCache]):
             plucker, "... t c (h h8) (w w8) -> ... t (c h8 w8) h w", h8=8, w8=8
         )
 
-        return I2VCamCtrlEmbeddings(i2v=i2v, plucker=plucker)
+        return I2VCamCtrlEmbeddings(i2v=i2v, plucker=plucker, poses=poses)
 
     @property
     def temporal_compression_ratio(self) -> int:
