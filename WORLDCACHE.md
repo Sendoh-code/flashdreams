@@ -119,8 +119,32 @@ building one is the main refactor toward the goal.
     the `kvbank.py` capacity check; unresolved). `ci_gpu` showed `..FF.Fs`
     but the log and all 5 generation runs died with `Errno 122` because the
     shared `/work/nvme/bicu` quota (550 GB hard) was full.
-  - Freed 120 GB and resubmitted unchanged as job 23900078; check its
-    `experiments/kv_offload/logs/kv-bank-test-23900078.out`.
+  - Freed 120 GB and resubmitted unchanged as job 23900078 (COMPLETED,
+    results `/work/nvme/bicu/ytian6/kv_offload/bank-23900078/`):
+    - `ci_cpu` still 2 failed (same budget check). `ci_gpu` 3 failed: the same
+      budget error in both `_cuda` bank tests, plus
+      `test_pre_and_post_rope_cache_match_without_roll[wan]` raising
+      `Must call before_update() before computing visible cache size`
+      (`test_rope_kvcache.py:72`); the lingbot variant is skipped (needs sm89+).
+    - resident-post hit the 600 s `timeout` (first chunk took 227 s of
+      compile/autotune), so its mp4 holds only the warmup chunk and the PSNRs
+      below are against that partial video: not meaningful.
+    - bank-chunk-post ok (steady 4.0 s/chunk, 3.97 fps, peak 21.9 GiB);
+      bank-frame-post ok; "PSNR" 16.2 / 15.9 dB.
+    - bank-chunk-pre and resident-pre: `InductorError: AssertionError` in
+      torch.compile, so pre-RoPE fails under compile even without the bank.
+  - Fixes (2026-11-13): `KVBank._allocate` capacity used `int()` on a float
+    (239.99… B floored to one entry short) → `round()`; the RoPE test read
+    `cached_k()` after `after_update()` → compares `_k`; pre-RoPE cached-K
+    rotation now goes through `apply_rope_freqs_copy` (`rope.py`, eager,
+    graph break, `ponytail:`), since Inductor asserts on that Triton kernel;
+    `bank_test.slurm` runs resident first, PSNR vs the same-RoPE resident only
+    if it finished, persistent inductor/Triton cache on `/work`, and splits via
+    `RUNS`/`TESTS`/`OUT` into two jobs that fit interactive's 1 h cap (regular
+    `gpuA40x4` queues for a week; interactive allows 1 job per user, so job B
+    is submitted after A ends). `ci_cpu` bank tests 6/6 pass on the login node.
+    Rerun: job A 23910329 (tests + resident-post/pre), then job B (bank runs),
+    shared output `/work/nvme/bicu/ytian6/kv_offload/bank-1113-1640/`.
 - Reference implementation: WorldKV (`git clone
   git@github.com:cvlab-kaist/WorldKV.git WorldKV && git -C WorldKV checkout
   046f6d1`, gitignored). `CameraPoseRetrieval` mirrors its

@@ -29,7 +29,7 @@ from flashdreams.accelerated.quantization.linear import (
 )
 from flashdreams.accelerated.quantization.quantizer import Granularity, quantize
 from flashdreams.core.attention import BlockKVCache
-from flashdreams.core.attention.rope import apply_rope_freqs
+from flashdreams.core.attention.rope import apply_rope_freqs, apply_rope_freqs_copy
 from flashdreams.recipes.wan.transformer.impl.modules import (
     Block,
     BlockCache,
@@ -221,7 +221,7 @@ class OptimizedSelfAttention(SelfAttention):
         key = kv_cache.cached_k()
         if not self.apply_rope_before_kvcache:
             # Cache holds un-rotated K; rotate a copy by cache-slot position.
-            key = apply_rope_freqs(key.clone(), rope_k, interleaved=True)
+            key = apply_rope_freqs_copy(key, rope_k, interleaved=True)
         if self.attention_backend == "sage":
             key_mean = None
             if key_history_sum is not None:

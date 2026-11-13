@@ -69,4 +69,4 @@ def test_pre_and_post_rope_cache_match_without_roll(backend: str) -> None:
                 caches[pre].after_update(chunk)
             torch.testing.assert_close(out[True], out[False], atol=3e-2, rtol=3e-2)
         # Post-RoPE stores rotated K; pre-RoPE stores raw K, so the caches differ.
-        assert not torch.equal(caches[True].self_attn.cached_k(), caches[False].self_attn.cached_k())
+        assert not torch.equal(caches[True].self_attn._k, caches[False].self_attn._k)

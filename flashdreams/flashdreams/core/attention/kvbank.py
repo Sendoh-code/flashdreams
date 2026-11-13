@@ -346,7 +346,8 @@ class KVBank:
                 (torch.Size(k_shape).numel() + torch.Size(v_shape).numel())
                 * cache.dtype.itemsize
             )
-        capacity = int(self.config.budget_gb * 1e9) // entry_bytes
+        # round(): int() floors 2 * 120 / 1e9 * 1e9 == 239.99... to one entry short.
+        capacity = round(self.config.budget_gb * 1e9) // entry_bytes
         per_chunk = self.frames_per_chunk // self.entry_frames
         if capacity < per_chunk:
             raise ValueError(

@@ -19,7 +19,7 @@ from flashdreams.core.attention import (
     ContextParallelAttention,
     NativeAttention,
 )
-from flashdreams.core.attention.rope import apply_rope_freqs
+from flashdreams.core.attention.rope import apply_rope_freqs, apply_rope_freqs_copy
 
 
 def sinusoidal_embedding_1d(dim: int, position: Tensor) -> Tensor:
@@ -275,8 +275,7 @@ class MultiHeadAttention(nn.Module):
             assert rope_freqs_k is not None, (
                 "KV-cache-relative RoPE requires rope_freqs_k for cached K"
             )
-            cached_k = cached_k.clone()
-            cached_k = apply_rope_freqs(cached_k, rope_freqs_k, interleaved=True)
+            cached_k = apply_rope_freqs_copy(cached_k, rope_freqs_k, interleaved=True)
 
         cached_v = kv_cache.cached_v()
 

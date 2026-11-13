@@ -147,7 +147,7 @@ retrieve 区就是 `BlockKVCache` sink 的尾部，所以窗口滚动不会动�
 | 280–298 | `plan()` | 每 chunk 算一次：窗口起点之前的条目作为候选 → `policy.select` → 按时间排序 |
 | 300–314 | `fetch(cache, slot_k, slot_v)` | 返回 retrieve 区的 `(dst, src)` H2D 拷贝 |
 | 316–330 | `store(cache)` | 返回把当前写入范围拷进 bank 行的 D2H 拷贝 |
-| 332–362 | `_allocate()` | 首次 `begin_chunk` 时按预算算容量，为每个注册的 cache 分配 `[capacity, *entry_shape]` pinned K/V；要求 `window_size >= chunk_size` |
+| 333–363 | `_allocate()` | 首次 `begin_chunk` 时按预算算容量（350 用 `round()`，`int()` 会把 239.99… B 截成少一个条目），为每个注册的 cache 分配 `[capacity, *entry_shape]` pinned K/V；要求 `window_size >= chunk_size` |
 
 导出：`flashdreams/flashdreams/core/attention/__init__.py` 7–14、`__all__` 加 6 个名字。
 
@@ -205,10 +205,11 @@ bank 原样存 cache 里的 K，所以不另设 bank 级开关，以免两个开
 
 | 文件:行号 | 内容 |
 | --- | --- |
-| `recipes/wan/transformer/impl/modules.py:217, 274–279, 287–302` | 已有：base `SelfAttention` 的两种路径与 `_slice_rope_freqs`（未改） |
+| `core/attention/rope.py:471–480` | `apply_rope_freqs_copy`：out-of-place、`@torch.compiler.disable` 的 cached-K 旋转。`ponytail:` 每次调用一个 graph break；torch 2.11 Inductor 的 `decompose_triton_kernel_wrapper_functional` 对 compile 内的该 Triton kernel 报 AssertionError（job 23900078 的 pre-RoPE 两个 run） |
+| `recipes/wan/transformer/impl/modules.py:217, 274–278, 286–301` | base `SelfAttention` 的两种路径与 `_slice_rope_freqs`；pre-RoPE 读时旋转改用 `apply_rope_freqs_copy`（278） |
 | `recipes/wan/transformer/wan21.py:550–555` | 已有：按开关选 RoPE adapter；本次让 relative 的 sink 包含 retrieve 区 |
 | `integrations_v2/lingbot/impl/transformer/impl/modules.py:139, 146` | `OptimizedSelfAttention(apply_rope_before_kvcache=...)` |
-| `lingbot/.../modules.py:215–224` | fused 路径：`_slice_rope_freqs` 取 q/k 频率；post 旋转后写 cache；pre 写未旋转 K，attention 前旋转 `cached_k().clone()`；三个后端统一用 `key` |
+| `lingbot/.../modules.py:215–224` | fused 路径：`_slice_rope_freqs` 取 q/k 频率；post 旋转后写 cache；pre 写未旋转 K，attention 前用 `apply_rope_freqs_copy(cached_k())` 旋转（224）；三个后端统一用 `key` |
 | `lingbot/.../modules.py:310, 318, 328` | `CamCtrlBlock(apply_rope_before_kvcache=...)` 透传给 `Block` 与 `OptimizedSelfAttention` |
 | `lingbot/.../modules.py:376–382` | pre-RoPE 时关闭 Sage `reuse_key_history`（存的是未旋转 K 的和） |
 | `integrations_v2/lingbot/impl/transformer/impl/network.py:190` | `_build_block` 传入 `self.apply_rope_before_kvcache`（此前 LingBot 一直强制 post） |
@@ -216,18 +217,18 @@ bank 原样存 cache 里的 K，所以不另设 bank 级开关，以免两个开
 
 测试：`integrations_v2/lingbot/tests/test_rope_kvcache.py:30–` `test_pre_and_post_rope_cache_match_without_roll`
 （`ci_gpu`）：sink 0、不滚窗时槽位位置 = 全局位置，两种模式的 `CamCtrlBlock` 输出应一致，
-而 cache 内容不同。参数化 `wan`，以及 sm89+ 才跑的 `scaled_fp8`（A40 会 skip）。
+而 cache 内容不同（最后比较 `_k` 原始 buffer，`after_update` 之后不能调 `cached_k()`）。参数化 `wan`，以及 sm89+ 才跑的 `scaled_fp8`（A40 会 skip）。
 
 ---
 
 ## 5. GPU 验证脚本
 
-`experiments/kv_offload/bank_test.slurm`（A40 interactive，1h）：
+`experiments/kv_offload/bank_test.slurm`（`gpuA40x4-interactive`，1h；每个 run `RUN_TIMEOUT` 默认 900 s；`TORCHINDUCTOR_CACHE_DIR` 持久化到 `/work`。`RUNS`=要跑的 run 名单，`TESTS=0` 跳过单测，`OUT` 指定共享输出目录，用法见脚本头注释——两个 job 串行拆分以满足 1h 上限）：
 1. `ci_cpu` bank/offload 测试；`ci_gpu` bank（CUDA）、offload 计时、LingBot RoPE 一致性。
 2. LingBot 1.3B 端到端（window 12、sink 4、16 blocks、seed 42）：`resident-post`、
-   `bank-chunk-post`、`bank-chunk-pre`、`resident-pre`、`bank-frame-post`（retrieve 8 帧，
+   `resident-pre`、`bank-chunk-post`、`bank-chunk-pre`、`bank-frame-post`（retrieve 8 帧，
    `CameraPoseRetrieval`，bank 4 GB）。输出在 `/work/nvme/bicu/ytian6/kv_offload/bank-<jobid>/`，
-   `summary.txt` 汇总状态和相对 `resident-post` 的 PSNR。
+   `summary.txt` 汇总状态和相对**同 RoPE 模式** resident 的 PSNR（只在该 resident 成功、留下 `ok` 标记时计算）。
 
 ---
 
