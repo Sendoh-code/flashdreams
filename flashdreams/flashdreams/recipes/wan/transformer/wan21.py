@@ -12,7 +12,7 @@ from typing import Any, overload
 import torch
 from torch import Tensor
 
-from flashdreams.core.attention import LayerwiseKVOffload
+from flashdreams.core.attention import KVBank, KVBankConfig, LayerwiseKVOffload
 from flashdreams.core.attention.rope import (
     KVCacheRelativeRotaryPositionEmbedding3D,
     RotaryPositionEmbedding3D,
@@ -201,6 +201,21 @@ class Wan21TransformerConfig(TransformerConfig):
     Requires ``use_cuda_graph=False``; every forward is bound by host-to-device
     bandwidth for the full visible history."""
 
+    kv_bank: KVBankConfig | None = None
+    """Budgeted host K/V bank with metadata-driven retrieval (needs ``kv_offload``).
+
+    Self-attention then sees ``[sink | retrieve_size_t retrieved frames |
+    window]``: the bank stores every chunk (or latent frame) generated past
+    the sink, and its policy picks which leave-the-window entries fill the
+    retrieve region each chunk. Frame granularity requires ``cp_size == 1``.
+
+    The bank stores K exactly as the cache does, so
+    ``network.apply_rope_before_kvcache`` picks the retrieved positions:
+    ``True`` (post-RoPE K) keeps each entry's original rollout position;
+    ``False`` (pre-RoPE K, cache-relative RoPE) places it at its retrieve slot,
+    and then ``sink_size_t + retrieve_size_t + window_size_t`` must be a
+    multiple of ``len_t``."""
+
     stamp_image_latent: bool = False
     """See class docstring (mask-inject I2V integration)."""
 
@@ -278,6 +293,15 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
         sink_size_t = config.sink_size_t // kt
         if config.kv_offload and config.use_cuda_graph:
             raise ValueError("kv_offload requires use_cuda_graph=False.")
+        if config.kv_bank is not None:
+            if not config.kv_offload:
+                raise ValueError("kv_bank requires kv_offload=True.")
+            assert config.kv_bank.retrieve_size_t % kt == 0, (
+                f"kv_bank.retrieve_size_t ({config.kv_bank.retrieve_size_t}) must be "
+                f"divisible by patch_size[0] ({kt})"
+            )
+            if config.kv_bank.granularity == "frame" and self._cp_size > 1:
+                raise ValueError("kv_bank granularity='frame' requires cp_size == 1.")
         cuda_graph_capture_ar_idx = (
             cuda_graph_capture_ar_index(
                 sink_size_t=sink_size_t,
@@ -382,6 +406,12 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
             cfg.network.out_dim * kt * kh * kw,
         )
 
+    @property
+    def _retrieve_size_t(self) -> int:
+        """Pre-patchify frames of the kv-bank retrieve region (0 without a bank)."""
+        bank = self.config.kv_bank
+        return bank.retrieve_size_t if bank is not None else 0
+
     @torch.no_grad()
     def _build_network_cache(
         self,
@@ -405,7 +435,8 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
         cp_size = self._cp_size
         chunk_size = self.latent_shape[-2]  # already CP-divided
         window_size_t = cfg.window_size_t // kt
-        sink_size_t = cfg.sink_size_t // kt
+        # The bank's retrieve region is the sink tail, so BlockKVCache never rolls it.
+        sink_size_t = (cfg.sink_size_t + self._retrieve_size_t) // kt
         assert (window_size_t * pHW) % cp_size == 0, (
             f"window_size_t * frame_token_count ({window_size_t * pHW}) must be "
             f"divisible by cp_size ({cp_size})"
@@ -476,7 +507,17 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
         )
 
         # One offload shared by both branches keeps device K/V at two layers.
-        kv_offload = LayerwiseKVOffload() if cfg.kv_offload else None
+        kv_offload = None
+        if cfg.kv_offload:
+            bank = None
+            if cfg.kv_bank is not None:
+                bank = KVBank(
+                    cfg.kv_bank,
+                    frames_per_chunk=cfg.len_t // kt,
+                    sink_frames=cfg.sink_size_t // kt,
+                    window_frames=cfg.window_size_t // kt,
+                )
+            kv_offload = LayerwiseKVOffload(bank=bank)
         network_cache = self._build_network_cache(
             text_embeddings=text_embeddings,
             image_embeddings=image_embeddings,
@@ -509,7 +550,7 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
         if cfg.network.apply_rope_before_kvcache:
             rope_adapter = RotaryPositionEmbedding3D(**rope_kwargs)
         else:
-            rope_kwargs["sink_size_t"] = cfg.sink_size_t // kt
+            rope_kwargs["sink_size_t"] = (cfg.sink_size_t + self._retrieve_size_t) // kt
             rope_kwargs["window_size_t"] = cfg.window_size_t // kt
             rope_adapter = KVCacheRelativeRotaryPositionEmbedding3D(**rope_kwargs)
         rope_adapter.set_context_parallel_group(cp_group=self._cp_group)

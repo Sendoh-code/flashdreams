@@ -466,3 +466,14 @@ def apply_rope_freqs(x: Tensor, freqs: Tensor, interleaved: bool = False) -> Ten
         Rotated tensor of shape ``[B, S, H, D]``, sharing storage with ``x``.
     """
     return apply_rotary_pos_emb(x, freqs, interleaved=interleaved, inplace=True)
+
+
+@torch.compiler.disable
+def apply_rope_freqs_copy(x: Tensor, freqs: Tensor, interleaved: bool = False) -> Tensor:
+    """Out-of-place :func:`apply_rope_freqs` for cached K (pre-RoPE caches), run eagerly.
+
+    ponytail: one graph break per call. Under ``torch.compile`` (torch 2.11),
+    Inductor's ``decompose_triton_kernel_wrapper_functional`` asserts on this
+    kernel applied to a copy of the cache; drop the disable once that is fixed.
+    """
+    return apply_rotary_pos_emb(x, freqs, interleaved=interleaved, inplace=False)

@@ -216,6 +216,12 @@ class LingbotWorldTransformer(Wan21Transformer):
                 cache.network_cache_uncond,
             )
             cache.camera_cache_chunk_idx = cache.autoregressive_index
+            offload = cache.network_cache.kv_offload
+            if offload is not None and offload.bank is not None and input.poses is not None:
+                offload.bank.annotate(
+                    cache.autoregressive_index,
+                    per_frame={"poses": input.poses.movedim(-3, 0).float().cpu()},
+                )
         return super().predict_flow(
             noisy_latent=noisy_latent,
             timestep=timestep,
@@ -239,6 +245,7 @@ class LingbotWorldTransformer(Wan21Transformer):
             return I2VCamCtrlEmbeddings(
                 i2v=super().patchify_and_maybe_split_cp(x.i2v),
                 plucker=super().patchify_and_maybe_split_cp(x.plucker),
+                poses=x.poses,
                 _is_patchified=True,
             )
         return super().patchify_and_maybe_split_cp(x)

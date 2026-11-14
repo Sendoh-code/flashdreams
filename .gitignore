@@ -149,3 +149,6 @@ imgui.ini
 # Personal source-reading notes
 KVCache*阅读指南*.md
 KVCache*阅读指南*.html
+
+# Upstream reference clone (see WORLDCACHE.md)
+WorldKV/
