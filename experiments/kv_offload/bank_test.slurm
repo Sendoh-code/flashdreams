@@ -74,8 +74,11 @@ run_one() {  # name rope retrieve granularity offload
     -- --example-data --total-blocks "$BLOCKS" --warmup-blocks 2 --seed 42 \
     > "$dir/run.log" 2>&1
   local rc=$? status=ok
-  [[ $rc -ne 0 ]] && status="exit$rc"
-  grep -q "OutOfMemoryError\|CUDA out of memory" "$dir/run.log" && status=oom
+  if [[ $rc -ne 0 ]]; then
+    status="exit$rc"
+    # Only a failed run counts as OOM; Triton autotune logs "OutOfMemoryError: out of resource".
+    grep -q "CUDA out of memory\|torch.OutOfMemoryError" "$dir/run.log" && status=oom
+  fi
   local psnr=- ref="$OUT/resident-$2"
   if [[ $status == ok && $name != resident-* && -f "$ref/ok" ]]; then
     psnr=$(ffmpeg -nostats -i "$dir/out.mp4" -i "$ref/out.mp4" \
