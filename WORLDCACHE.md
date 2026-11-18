@@ -58,13 +58,17 @@ building one is the main refactor toward the goal.
 
 ### Layerwise host KV offload (prototype)
 
-- `LayerwiseKVOffload` keeps each `BlockKVCache` K/V home in pinned host
-  memory and streams layers through two GPU slots (reusing the first two
-  caches' buffers to keep custom layouts such as LingBot's TMA padding).
-  `before_layer(i)` prefetches layer `i+1` on a side stream; `after_layer(i)`
-  writes back only the current write range. One offload is shared by CFG
-  cond and uncond.
-- `synchronize()` must run before the host-side window roll; it is wired into
+- `LayerwiseKVOffload` streams `BlockKVCache` layers through two GPU slots
+  (reusing the first two caches' buffers to keep custom layouts such as
+  LingBot's TMA padding). Host storage per layer is a pinned sink buffer plus
+  `KVBank` entries, the only host copy of everything past the sink; without a
+  configured bank the offload builds a window-only one. `before_layer(i)`
+  assembles layer `i+1` (sink, retrieved, window gathered from bank entries by
+  index) on a side stream; `after_layer(i)` writes back only the current write
+  range. Between layers caches hold meta tensors, so the window roll moves no
+  memory. One offload is shared by CFG cond and uncond.
+- `begin_chunk()` (synchronize + bank row allocation/eviction) must run before
+  each forward's `before_update`; it is wired into
   `WanDiTNetworkCache.before_update`.
 - Timing: `FLASHDREAMS_KV_OFFLOAD_TIMING=1`, optional
   `FLASHDREAMS_KV_OFFLOAD_TIMING_JSONL=<path>`.
@@ -151,6 +155,22 @@ building one is the main refactor toward the goal.
   `image2video_fast.py`.
 - File/line map: `WORLDCACHE_IMPL.md` §3–§5.
 
+### Bank as the only host store (2026-11-18, uncommitted, CPU-validated)
+
+- Why: with a full pinned home per layer, `BlockKVCache`'s window roll ran
+  on host memory (clone + copy of the whole window): ~1.84 s of a 5.1 s chunk
+  for LingBot 1.3B W40/S6 (`compare-24082157/offload-w40/run.log`, timing
+  lines from `WanDiTNetworkCache.before_update`). With a bank, window chunks
+  also existed twice on host and were written back twice.
+- Now: home is gone (sink buffer only); the window is `KVBank.window()` index
+  lookups over the newest entries; bank capacity is at least the window and
+  evicting an in-window entry raises. Details and line map:
+  `WORLDCACHE_IMPL.md` §6.
+- `ci_cpu` `test_kvcache.py` 19 passed (offload parity now parametrized over
+  chunk-unaligned sink/window). GPU tests and an end-to-end rerun of
+  `compare.slurm` (`offload-w40`, `ours`) with `FLASHDREAMS_KV_OFFLOAD_TIMING=1`
+  are pending: expect `roll` ≈ 0 ms and unchanged PSNR.
+
 ### Known gaps
 
 - `ci_cpu` KV tests run on Delta; 2 bank tests fail (see above). GPU tests
@@ -165,6 +185,8 @@ building one is the main refactor toward the goal.
 
 1. Read this file, then `WORLDCACHE_IMPL.md` (file/line map; keep it updated
    with every KV change and bump its baseline commit).
+   To rerun tests and experiments (setup, path overrides, every run's meaning,
+   historical numbers to compare against): `WORLDCACHE_EXPERIMENTS.md`.
 2. Clone WorldKV as above if you need the reference code.
 3. Slurm scripts hard-code Delta paths (`/work/nvme/bicu/ytian6`,
    account `bicu-delta-gpu`); override `SWEEP_ROOT`/`HF_HOME` elsewhere.
@@ -179,6 +201,9 @@ building one is the main refactor toward the goal.
    (`skills/profile-model-performance`, `skills/validate-performance-quality`).
 3. If H2D dominates, remove the `ponytail:` ceiling: skip the write range in
    prefetch and keep a chunk's history resident across its denoising steps.
-4. Design a model-agnostic KV policy interface in `core` (storage tier +
+4. GPU-validate the bank-as-only-store change (see Status): `ci_gpu`
+   `test_kvcache.py`, then `compare.slurm` `offload-w40` and `ours` with
+   timing; compare chunk time, host RSS, and PSNR against `compare-24082157`.
+5. Design a model-agnostic KV policy interface in `core` (storage tier +
    eviction/retrieval policy) and port window/sink, full, and offload onto it.
-5. Add chunk-level KV identity and a store/lookup path (LMCache-style reuse).
+6. Add chunk-level KV identity and a store/lookup path (LMCache-style reuse).

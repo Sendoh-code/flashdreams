@@ -3,13 +3,14 @@
 
 """Budgeted host K/V bank with metadata and pluggable retrieval into the attention window.
 
-Used through :class:`~flashdreams.core.attention.kvcache.LayerwiseKVOffload`:
-every chunk the model writes is also stored in the bank as one entry per chunk
-or per latent frame, and each forward the offload fetches the entries chosen by
-a :class:`KVRetrievalPolicy` into a ``retrieve`` region of the device slot. The
-attended layout per layer becomes ``[sink | retrieved | recent window]``; the
-``retrieved`` region sits at the tail of the cache's sink, so ``BlockKVCache``
-never rolls it.
+Used through :class:`~flashdreams.core.attention.kvcache.LayerwiseKVOffload`
+as the only host copy of everything past the sink: every chunk the model writes
+is stored as one entry per chunk or per latent frame, each forward the rolling
+window is gathered from the newest entries by index (so rolling the window moves
+no memory), and the entries chosen by a :class:`KVRetrievalPolicy` fill a
+``retrieve`` region of the device slot. The attended layout per layer is
+``[sink | retrieved | recent window]``; the ``retrieved`` region sits at the
+tail of the cache's sink, so ``BlockKVCache`` never rolls it.
 """
 
 from __future__ import annotations
@@ -131,7 +132,10 @@ class KVBankConfig:
     """Host K/V bank and retrieval knobs (frames are pre-patchify, like ``window_size_t``)."""
 
     budget_gb: float = 8.0
-    """Pinned host memory for stored entries, summed over all layers and CFG branches."""
+    """Pinned host memory for stored entries, summed over all layers and CFG branches.
+
+    Entries in the rolling window live here too, so a budget below what the
+    window needs is raised to it (``0`` stores exactly the window)."""
 
     granularity: Literal["chunk", "frame"] = "chunk"
     """Store and retrieve whole AR chunks or single latent frames."""
@@ -227,13 +231,24 @@ class KVBank:
         )
         self._current = []
         self._plan = None
+        # Frames at or past here are in the cache's rolling window this chunk.
+        window_start = max(
+            self.sink_frames + self.k * self.entry_frames,
+            first + self.frames_per_chunk - self.window_frames,
+        )
         for offset in range(0, self.frames_per_chunk, self.entry_frames):
-            if first + offset < self.sink_frames:
-                continue  # the true sink stays resident; never a candidate
+            if first + offset + self.entry_frames <= self.sink_frames:
+                continue  # entirely in the true sink, which the offload keeps
             if not self._free:
                 # ponytail: FIFO eviction (oldest entry first); add an eviction
                 # policy hook if retrieval should keep old but relevant entries.
-                self._free.append(self.entries.pop(0).slot)
+                old = self.entries.pop(0)
+                if old.frame + old.num_frames > window_start:
+                    raise RuntimeError(
+                        f"kv bank holds {self.capacity} entries, too few for the "
+                        f"window: evicting frame {old.frame} still in it."
+                    )
+                self._free.append(old.slot)
             entry = KVBankEntry(
                 chunk_idx=chunk_idx,
                 frame=first + offset,
@@ -288,7 +303,10 @@ class KVBank:
                     first + self.frames_per_chunk - self.window_frames,
                 )
                 candidates = [
-                    e for e in self.entries if e.frame + e.num_frames <= window_start
+                    e
+                    for e in self.entries
+                    if e.frame >= self.sink_frames
+                    and e.frame + e.num_frames <= window_start
                 ]
                 if candidates:
                     chosen = self.config.policy.select(
@@ -311,6 +329,44 @@ class KVBank:
                 (slot_k[region], store_k[entry.slot]),
                 (slot_v[region], store_v[entry.slot]),
             ]
+        return copies
+
+    def window(
+        self, cache: BlockKVCache, slot_k: Tensor, slot_v: Tensor
+    ) -> list[tuple[Tensor, Tensor]]:
+        """``(dst, src)`` copies of the stored entries covering ``cache``'s rolling window.
+
+        The window is ``cache``'s visible range past its sink, read from the
+        newest entries by token index, so rolling never moves stored memory.
+        """
+        store_k, store_v = self._store[id(cache)]
+        size = self.entry_tokens(cache)
+        end = cache.size
+        if end <= cache.sink_size:
+            return []
+        assert cache._curr_chunk_idx is not None
+        # Rollout token index of a physical cache position past the sink.
+        shift = (cache._curr_chunk_idx + 1) * cache.chunk_size - end
+        start = cache.sink_size + shift
+        copies = []
+        covered = 0
+        for entry in reversed(self.entries):  # newest first; entries are frame-ordered
+            first = entry.chunk_idx * cache.chunk_size + (
+                entry.frame - entry.chunk_idx * self.frames_per_chunk
+            ) // self.entry_frames * size
+            if first + size <= start:
+                break
+            lo = max(first, start)
+            src = cache._seq_slice(lo - first, size)
+            dst = cache._seq_slice(lo - shift, first + size - shift)
+            copies += [
+                (slot_k[dst], store_k[entry.slot][src]),
+                (slot_v[dst], store_v[entry.slot][src]),
+            ]
+            covered += first + size - lo
+        assert covered == end - cache.sink_size, (
+            f"kv bank covers {covered} of {end - cache.sink_size} window tokens"
+        )
         return copies
 
     def store(self, cache: BlockKVCache) -> list[tuple[Tensor, Tensor]]:
@@ -348,12 +404,8 @@ class KVBank:
             )
         # round(): int() floors 2 * 120 / 1e9 * 1e9 == 239.99... to one entry short.
         capacity = round(self.config.budget_gb * 1e9) // entry_bytes
-        per_chunk = self.frames_per_chunk // self.entry_frames
-        if capacity < per_chunk:
-            raise ValueError(
-                f"kv bank budget {self.config.budget_gb} GB holds {capacity} entries; "
-                f"one chunk needs {per_chunk} ({entry_bytes / 1e6:.1f} MB each)."
-            )
+        # The window is ``window_frames`` ending on an entry boundary.
+        capacity = max(capacity, -(-self.window_frames // self.entry_frames))
         pin = torch.cuda.is_available()
         for cache, (k_shape, v_shape) in zip(self._caches, shapes, strict=True):
             self._store[id(cache)] = (

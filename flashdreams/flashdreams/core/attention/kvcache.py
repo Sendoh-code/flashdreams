@@ -12,15 +12,13 @@ from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from itertools import pairwise
-from typing import TYPE_CHECKING
 
 import torch
 from loguru import logger
 from torch import Tensor
 from typing_extensions import Self
 
-if TYPE_CHECKING:
-    from flashdreams.core.attention.kvbank import KVBank
+from flashdreams.core.attention.kvbank import KVBank, KVBankConfig
 
 LayerKV = tuple[Tensor, Tensor]
 """Key/value tensors for one attention layer."""
@@ -892,12 +890,16 @@ class BlockKVCache:
 class LayerwiseKVOffload:
     """Keep ``BlockKVCache`` layers in host memory and stream them through two device slots.
 
-    Every added cache keeps its K/V home in pinned host memory. While layer
-    ``i`` computes, layer ``i + 1`` is copied into the other device slot on a
-    side stream; once layer ``i`` finishes, only its current write range is
-    copied back home. Device K/V residency is two layers regardless of depth,
-    and one offload can be shared by several network caches (e.g. CFG cond and
-    uncond) because they run one after another.
+    Host memory per cache is its sink in a pinned buffer plus everything past
+    the sink as :class:`~flashdreams.core.attention.kvbank.KVBank` entries, the
+    only host copy. While layer ``i`` computes, layer ``i + 1`` is assembled in
+    the other device slot on a side stream (sink buffer, retrieved entries, and
+    the rolling window gathered from the newest entries by index); once layer
+    ``i`` finishes, only its current write range is copied back. Between layers
+    a cache holds meta tensors, so its ``before_update`` window roll moves no
+    memory. Device K/V residency is two layers regardless of depth, and one
+    offload can be shared by several network caches (e.g. CFG cond and uncond)
+    because they run one after another.
 
     Per-forward usage (each cache must already be between ``before_update``
     and ``after_update``)::
@@ -907,9 +909,9 @@ class LayerwiseKVOffload:
             x = block(x, caches[i])
             offload.after_layer(caches, i)
 
-    Host-side cache mutation (the ``before_update`` window roll) must call
-    :meth:`synchronize` first. Slot rebinding and side-stream copies are not
-    CUDA-graph compatible.
+    Call :meth:`begin_chunk` before the caches' ``before_update`` of every
+    forward: it synchronizes and lets the bank hand rows to the new chunk.
+    Slot rebinding and side-stream copies are not CUDA-graph compatible.
 
     ``FLASHDREAMS_KV_OFFLOAD_TIMING=1`` records CUDA events around each layer's
     fetch, compute, and write-back. :meth:`synchronize` then logs one summary
@@ -917,18 +919,19 @@ class LayerwiseKVOffload:
     ``FLASHDREAMS_KV_OFFLOAD_TIMING_JSONL=<path>`` also appends each forward's
     rows to that file as one JSON line.
 
-    With a :class:`~flashdreams.core.attention.kvbank.KVBank`, every written
-    chunk is also stored in the bank, and each prefetch fills the cache's
-    retrieve region (the sink tail) with the entries the bank's retrieval
-    policy picked instead of the host home's copy.
+    With a caller's bank, each prefetch also fills the cache's retrieve region
+    (the sink tail) with the entries its retrieval policy picked instead of the
+    sink buffer's copy. Without one, :meth:`add` builds a window-only bank.
     """
 
     def __init__(self, bank: KVBank | None = None) -> None:
         self.bank = bank
-        """Optional metadata-indexed store feeding the retrieve region."""
+        """Caller's bank (metadata + retrieval); ``None`` when only offloading."""
+        self._bank = bank
         self._slots: list[LayerKV] = []
         self._ready: list[torch.cuda.Event] = []
-        self._home: dict[int, LayerKV] = {}
+        self._sink: dict[int, LayerKV] = {}
+        self._idle: dict[int, LayerKV] = {}
         self._stream: torch.cuda.Stream | None = None
         self._timing = os.environ.get("FLASHDREAMS_KV_OFFLOAD_TIMING") == "1"
         self._events: dict[int, dict[str, torch.cuda.Event | int]] = {}
@@ -938,7 +941,7 @@ class LayerwiseKVOffload:
         ``writeback_ms``, ``fetch_mb``. Filled only when timing is enabled."""
 
     def add(self, cache: BlockKVCache) -> None:
-        """Move ``cache`` storage home to host; the first two device buffers become slots.
+        """Move ``cache`` storage to host; the first two device buffers become slots.
 
         Call right after each cache is built so peak device memory stays at a
         few layers instead of the whole network.
@@ -955,18 +958,29 @@ class LayerwiseKVOffload:
                 f"offloaded layers need one K/V shape; got {tuple(cache._k.shape)}, "
                 f"slots hold {tuple(self._slots[0][0].shape)}."
             )
+        if self._bank is None:
+            # Token units, one entry per chunk, no retrieval: exactly the window.
+            self._bank = KVBank(
+                KVBankConfig(budget_gb=0.0),
+                frames_per_chunk=cache.chunk_size,
+                sink_frames=cache.sink_size,
+                window_frames=cache.window_size,
+            )
+        self._bank.add(cache)
         pin = self._stream is not None
-        home = (
-            torch.empty(cache.k_shape, dtype=cache.dtype, pin_memory=pin),
-            torch.empty(cache.v_shape, dtype=cache.dtype, pin_memory=pin),
+        k_shape, v_shape = list(cache.k_shape), list(cache.v_shape)
+        k_shape[cache.seq_dim] = v_shape[cache.seq_dim] = cache.sink_size
+        self._sink[id(cache)] = (
+            torch.empty(k_shape, dtype=cache.dtype, pin_memory=pin),
+            torch.empty(v_shape, dtype=cache.dtype, pin_memory=pin),
         )
-        self._home[id(cache)] = home
-        cache._k, cache._v = home
-        if self.bank is not None:
-            self.bank.add(cache)
+        self._idle[id(cache)] = cache._k, cache._v = (
+            torch.empty(cache.k_shape, dtype=cache.dtype, device="meta"),
+            torch.empty(cache.v_shape, dtype=cache.dtype, device="meta"),
+        )
 
     def synchronize(self) -> None:
-        """Wait for pending copies so host homes are safe to read or mutate."""
+        """Wait for pending copies so host storage is safe to read or mutate."""
         if self._stream is not None:
             # The last write-back waits on the last compute, so every recorded
             # event of finished forwards is complete after this.
@@ -978,14 +992,14 @@ class LayerwiseKVOffload:
     def begin_chunk(self, chunk_idx: int) -> None:
         """Synchronize, then let the bank allocate entries for ``chunk_idx``."""
         self.synchronize()
-        if self.bank is not None:
-            self.bank.begin_chunk(chunk_idx)
+        assert self._bank is not None, "add() caches before the first chunk"
+        self._bank.begin_chunk(chunk_idx)
 
     def reset(self) -> None:
         """Forget per-rollout state (bank entries); buffers stay allocated."""
         self.synchronize()
-        if self.bank is not None:
-            self.bank.reset()
+        if self._bank is not None:
+            self._bank.reset()
 
     @torch.compiler.disable
     def before_layer(self, caches: Sequence[BlockKVCache], index: int) -> None:
@@ -1006,10 +1020,11 @@ class LayerwiseKVOffload:
 
     @torch.compiler.disable
     def after_layer(self, caches: Sequence[BlockKVCache], index: int) -> None:
-        """Write the layer's current chunk back home and rebind the cache to it."""
+        """Write the layer's current chunk back to host and unbind the slot."""
         cache = caches[index]
-        home_k, home_v = self._home[id(cache)]
-        write = cache._seq_slice(*cache._current_write_bounds())
+        sink_k, sink_v = self._sink[id(cache)]
+        start, end = cache._current_write_bounds()
+        sink = cache._seq_slice(start, min(end, cache.sink_size))
         timed = self._timing and self._stream is not None
         if timed:
             self._events[index]["compute_end"] = self._record()
@@ -1018,15 +1033,15 @@ class LayerwiseKVOffload:
         with self._side_stream():
             if timed:
                 self._events[index]["writeback_start"] = self._record(self._stream)
-            home_k[write].copy_(cache._k[write], non_blocking=True)
-            home_v[write].copy_(cache._v[write], non_blocking=True)
-            if self.bank is not None:
-                # Every denoising step overwrites the same rows; the last wins.
-                for dst, src in self.bank.store(cache):
-                    dst.copy_(src, non_blocking=True)
+            if start < cache.sink_size:
+                sink_k[sink].copy_(cache._k[sink], non_blocking=True)
+                sink_v[sink].copy_(cache._v[sink], non_blocking=True)
+            # Every denoising step overwrites the same rows; the last wins.
+            for dst, src in self._bank.store(cache):  # type: ignore[union-attr]
+                dst.copy_(src, non_blocking=True)
             if timed:
                 self._events[index]["writeback_end"] = self._record(self._stream)
-        cache._k, cache._v = home_k, home_v
+        cache._k, cache._v = self._idle[id(cache)]
         if timed and index == len(caches) - 1:
             self._pending.append(self._events)
             self._events = {}
@@ -1044,20 +1059,19 @@ class LayerwiseKVOffload:
         cache = caches[index]
         slot = index % 2
         slot_k, slot_v = self._slots[slot]
-        bank = self.bank
-        retrieved = bank.fetch(cache, slot_k, slot_v) if bank is not None else []
-        if retrieved:
-            # Bank entries replace home's copy of the retrieve region.
-            assert bank is not None
-            start = bank.memory_start(cache)
-            filled = len(retrieved) // 2 * bank.entry_tokens(cache)
-            spans = [(0, start), (start + filled, cache.size)]
-        else:
-            spans = [(0, cache.size)]
-        copies = list(retrieved)
-        for begin, end in spans:
-            region = cache._seq_slice(begin, end)
-            copies += [(slot_k[region], cache._k[region]), (slot_v[region], cache._v[region])]
+        sink_k, sink_v = self._sink[id(cache)]
+        bank = self._bank
+        assert bank is not None
+        retrieved = bank.fetch(cache, slot_k, slot_v)
+        # Bank entries replace the sink buffer's copy of the retrieve region.
+        start = bank.memory_start(cache)
+        filled = len(retrieved) // 2 * bank.entry_tokens(cache)
+        sink_end = min(cache.size, cache.sink_size)
+        copies = retrieved + bank.window(cache, slot_k, slot_v)
+        for begin, end in [(0, min(start, sink_end)), (start + filled, sink_end)]:
+            if begin < end:
+                region = cache._seq_slice(begin, end)
+                copies += [(slot_k[region], sink_k[region]), (slot_v[region], sink_v[region])]
         with self._side_stream():
             timed = self._timing and self._stream is not None
             if timed:
