@@ -1052,10 +1052,11 @@ class LayerwiseKVOffload:
         return torch.cuda.stream(self._stream)
 
     def _prefetch(self, caches: Sequence[BlockKVCache], index: int) -> None:
-        # ponytail: copies the whole visible prefix, including the chunk this
-        # forward overwrites, and re-copies unchanged history on every
-        # denoising step; skip the write range or cache history across steps
-        # if H2D bandwidth dominates.
+        # ponytail: copies the whole visible prefix (including the chunk this
+        # forward overwrites) on every denoising step, because two slots
+        # cannot hold history across a full network pass. Hidden behind
+        # compute at W40 on A100; bytes grow with visible length. If H2D
+        # stalls dominate, keep the first M layers resident on device.
         cache = caches[index]
         slot = index % 2
         slot_k, slot_v = self._slots[slot]

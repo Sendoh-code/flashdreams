@@ -29,10 +29,10 @@ host 侧只有 sink buffer + `KVBank` 条目（§6），不再有整层 home。
 | 1004–1019 | `before_layer(caches, i)` | 预取 `i+1` 层；计算流 `wait_event(_ready[slot])`（1015）；绑定 GPU slot |
 | 1021–1046 | `after_layer(caches, i)` | `wait_stream`（1032）；写入范围落在 sink 内的部分拷回 sink buffer；当前 chunk 经 `_bank.store` 拷进 bank 行（1040）；cache 绑回 meta（1044） |
 | 1048–1051 | `_side_stream()` | 无 CUDA 时退化为 `nullcontext` |
-| 1053–1089 | `_prefetch(caches, i)` | slot = retrieve 区（`bank.fetch`）+ 窗口（`bank.window`，1070）+ sink buffer 其余两段；`_ready[slot].record`（1082）。`ponytail:`（1055–1058）：每个去噪步重拷整段历史 |
-| 1091–1094 | `_record()` | 计时 CUDA event |
-| 1096–1150 | `_log_forward()` | 每层 `fetch_ms / stall_ms / compute_ms / writeback_ms / fetch_mb`；JSONL（1126） |
-| 1153– | `__all__` | |
+| 1053–1090 | `_prefetch(caches, i)` | slot = retrieve 区（`bank.fetch`）+ 窗口（`bank.window`，1071）+ sink buffer 其余两段；`_ready[slot].record`（1083）。`ponytail:`（1055–1059）：每个去噪步重拷整段历史 |
+| 1092–1095 | `_record()` | 计时 CUDA event |
+| 1097–1151 | `_log_forward()` | 每层 `fetch_ms / stall_ms / compute_ms / writeback_ms / fetch_mb`；JSONL（1127） |
+| 1154– | `__all__` | |
 
 依赖的 `BlockKVCache` 方法（未改动）：
 `size`（600），`_seq_slice`（655），`_current_write_bounds`（695），
@@ -96,7 +96,7 @@ compute     :          wait r0 [layer 0]    wait r1 [layer 1]    wait r2 ...
 ### 1.5 计时 / 观测
 
 - 环境变量：`FLASHDREAMS_KV_OFFLOAD_TIMING=1`（kvcache.py:936），
-  `FLASHDREAMS_KV_OFFLOAD_TIMING_JSONL=<path>`（kvcache.py:1126）。
+  `FLASHDREAMS_KV_OFFLOAD_TIMING_JSONL=<path>`（kvcache.py:1127）。
 - 事件记录点在 `_prefetch` / `before_layer` / `after_layer` 内；`fetch_mb` 包含 sink、检索和窗口三类拷贝。
 - 每 chunk 的 host 侧 `begin_chunk` / `roll` 耗时：Wan `network.py:57–62` 的日志行。
 
@@ -155,7 +155,7 @@ retrieve 区就是 `BlockKVCache` sink 的尾部，所以窗口滚动不会动�
 ### 3.2 接入 offload（`kvcache.py`）
 
 `LayerwiseKVOffload(bank=...)`（927），`add` 注册（969），`begin_chunk` / `reset`（992–1002），
-`after_layer` 存 bank（1040），`_prefetch` 用 bank 填 retrieve 区和窗口，sink buffer 拷剩下两段（1053–1089）。
+`after_layer` 存 bank（1040），`_prefetch` 用 bank 填 retrieve 区和窗口，sink buffer 拷剩下两段（1053–1090）。
 检索不足 k 条时，retrieve 区剩余位置是 sink buffer 的内容（即 filling 阶段写进去的、真 sink 之后几帧）。
 
 ### 3.3 Wan recipe 接线
@@ -266,7 +266,7 @@ H2D 字节数不变（每层每条目一次拷贝，frame 粒度下拷贝调用�
 对应 `WORLDCACHE.md` → Next Steps：
 
 - [x] host home 与 bank 合并、窗口 = bank 索引（§6）
-- [ ] （暂缓，job 24131186 显示 W40 下 fetch 被 compute 掩盖）`_prefetch` 的 `ponytail:` 上限：两个 slot 下跨去噪步保留历史等于全层常驻，可行的是 `resident_layers` 开关（前 M 层常驻显存）；跳过写入范围只省约 9% 字节（`kvcache.py` `_prefetch` 1053–1089、`after_layer` 1021–1046）
+- [ ] （暂缓，job 24131186 显示 W40 下 fetch 被 compute 掩盖）`_prefetch` 的 `ponytail:` 上限：两个 slot 下跨去噪步保留历史等于全层常驻，可行的是 `resident_layers` 开关（前 M 层常驻显存）；跳过写入范围只省约 9% 字节（`kvcache.py` `_prefetch` 1053–1090、`after_layer` 1021–1046）
 - [ ] `core` 中模型无关的 KV policy 接口（存储层级 + 驱逐/检索策略），把 window/sink、full、offload 迁移上去
 - [ ] chunk 级 KV identity（chunk index、相机位姿、prompt）与 store/lookup 路径
 - [ ] 多 session / 显存预算 / 每 chunk 延迟

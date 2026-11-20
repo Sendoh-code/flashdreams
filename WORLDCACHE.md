@@ -184,8 +184,9 @@ building one is the main refactor toward the goal.
 
 ### Known gaps
 
-- `ci_cpu` KV tests run on Delta; 2 bank tests fail (see above). GPU tests
-  and the end-to-end bank runs have no clean result yet.
+- `ci_gpu` `test_kvcache.py` not yet run after the bank-as-only-store change.
+  End-to-end bank runs (`bank-1113-1640`, all five ok; A40 bank ≈ +26%
+  s/chunk vs resident, −3.8 GiB GPU) are in `WORLDCACHE_EXPERIMENTS.md` §3.
 - No quality parity vs resident KV, no perf numbers beyond the one sweep point.
 - Each prefetch re-copies the whole visible prefix on every denoising step
   (marked `ponytail:` in `_prefetch`). Inherent to two device slots: keeping

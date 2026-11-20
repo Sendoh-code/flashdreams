@@ -182,9 +182,25 @@ sbatch --dependency=afterany:$A --export=ALL,TESTS=0,RUNS="bank-chunk-post bank-
 `TESTS=0` 跳过第 1 节的单测。`summary.txt` 里每行是 `status` 以及与同 RoPE 模式 resident 的 PSNR
 （只有那个 resident 留下了 `ok` 标记时才计算）。
 
-历史结果：job 23900078 中 `bank-chunk-post` 跑通（稳态 4.0 s/chunk，显存峰值 21.9 GiB）；
-pre-RoPE 当时在 Inductor 报错，之后已修复（`apply_rope_freqs_copy`）。
-`bank-1113-1640` 中 resident 曾在 A40 上 OOM，后来单独重跑成功。没有完整的一组结果，**需要重跑**。
+**历史结果**（A40，`bank-1113-1640`，16 个 block，去掉 2 个 warmup 后的中位 chunk 耗时）：
+
+| run | 来源 job | chunk s | GPU 峰值 GiB | PSNR vs 同 RoPE resident |
+| --- | --- | --- | --- | --- |
+| `resident-post` | 24046877（11-16） | 2.94 | 25.7 | – |
+| `resident-pre` | 23910329（11-13） | 3.02 | 25.7 | – |
+| `bank-chunk-post` | 24046879（11-18） | 3.72 | 21.9 | 19.95 dB |
+| `bank-chunk-pre` | 24046879 | 3.79 | 21.9 | 20.23 dB |
+| `bank-frame-post` | 24046879 | 3.72 | 21.9 | 19.93 dB |
+
+- 五个 run 全部跑通，pre-RoPE（`apply_rope_freqs_copy`）与 frame 粒度端到端可用；同一节、两个 job 的
+  单测 `ci_cpu` 6 passed、`ci_gpu` 6 passed / 1 skipped（23910329）。
+- 24046879 在 11-16 以 `711ff4f5` 提交，11-18 18:15 才开始，跑的是当时的工作树（「bank 作为唯一 host 存储」之后）；
+  两个 resident 来自更早的 commit。resident 不 offload，与这次改动无关，可以直接对比。
+- 23910329 的 `summary.txt` 把 `resident-pre` 记成 oom，但目录里有 `ok` 和完整输出；这是 `711ff4f5` 修掉的误判。
+- bank 比 resident 慢约 0.8 s/chunk（+26%），省 3.8 GiB 显存：多出的是 offload 的 stall 和 8 个检索帧的 attention。
+- PSNR ≈ 20 dB 只说明偏离程度（检索改变了 attention 的内容），不代表质量；同配置重复跑也只有 22–25 dB。
+  pre / post 与 chunk / frame 之间没有可区分的差异。
+- 早先 job 23900078 的 `bank-chunk-post`：稳态 4.0 s/chunk，显存 21.9 GiB。
 
 ---
 
