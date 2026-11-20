@@ -155,7 +155,7 @@ building one is the main refactor toward the goal.
   `image2video_fast.py`.
 - File/line map: `WORLDCACHE_IMPL.md` §3–§5.
 
-### Bank as the only host store (2026-11-18, uncommitted, CPU-validated)
+### Bank as the only host store (2026-11-18, `8c4a9932`, A100-validated)
 
 - Why: with a full pinned home per layer, `BlockKVCache`'s window roll ran
   on host memory (clone + copy of the whole window): ~1.84 s of a 5.1 s chunk
@@ -167,17 +167,31 @@ building one is the main refactor toward the goal.
   evicting an in-window entry raises. Details and line map:
   `WORLDCACHE_IMPL.md` §6.
 - `ci_cpu` `test_kvcache.py` 19 passed (offload parity now parametrized over
-  chunk-unaligned sink/window). GPU tests and an end-to-end rerun of
-  `compare.slurm` (`offload-w40`, `ours`) with `FLASHDREAMS_KV_OFFLOAD_TIMING=1`
-  are pending: expect `roll` ≈ 0 ms and unchanged PSNR.
+  chunk-unaligned sink/window). `ci_gpu` tests still pending.
+- A100 job 24131186 (`compare-1118-1550`, commit `99b072de`): `roll` < 2 ms
+  per chunk; offload-w40 5.10 → 3.29 s/chunk (4.86 fps), ours 4.81 → 3.74
+  s/chunk (4.28 fps), ours host RSS 50.9 → 39.5 GiB, GPU peak unchanged
+  (22.3 / 22.5 GiB). Revisit PSNR 13.15 / 13.41 is within run-to-run noise
+  (repeat runs of one config differ by ~22–25 dB PSNR).
+- Steady-state per forward (30 layers): offload-w40 fetch 523 / compute 544 /
+  stall 39 ms, 12.8 GB; ours 615 / 622 / 54 ms, 15.0 GB. H2D runs at
+  ~24.5 GB/s (pinned peak) but is hidden behind compute: stall is ~7% of a
+  forward, and offload-w40 is only 4% slower than resident-w40 (3.29 vs 3.15
+  s/chunk). ours vs offload-w40 (+0.45 s/chunk) is entirely the 8 retrieved
+  frames: attention covers 54 vs 46 frames (15.0/12.8 GB = 54/46), +78 ms
+  compute × 5 forwards ≈ the +0.40 s diffuse gap; retrieval host cost is
+  negligible.
 
 ### Known gaps
 
 - `ci_cpu` KV tests run on Delta; 2 bank tests fail (see above). GPU tests
   and the end-to-end bank runs have no clean result yet.
 - No quality parity vs resident KV, no perf numbers beyond the one sweep point.
-- H2D-bandwidth bound: each prefetch re-copies the whole visible prefix on
-  every denoising step (marked `ponytail:` in `_prefetch`).
+- Each prefetch re-copies the whole visible prefix on every denoising step
+  (marked `ponytail:` in `_prefetch`). Inherent to two device slots: keeping
+  history across steps means keeping every layer resident. Hidden at W40 on
+  A100 (fetch ≈ compute); bytes grow linearly with visible length, so longer
+  windows or faster compute will make it the bottleneck.
 - Not CUDA-graph compatible (slot rebinding + side stream).
 - Covers only `BlockKVCache` in the Wan recipe; not a general policy interface.
 
@@ -199,11 +213,12 @@ building one is the main refactor toward the goal.
 2. GPU run of the full-KV offload runner with timing enabled; compare output
    and latency against `lingbot-world-v2-1p3b-causal-fast-perf`
    (`skills/profile-model-performance`, `skills/validate-performance-quality`).
-3. If H2D dominates, remove the `ponytail:` ceiling: skip the write range in
-   prefetch and keep a chunk's history resident across its denoising steps.
-4. GPU-validate the bank-as-only-store change (see Status): `ci_gpu`
-   `test_kvcache.py`, then `compare.slurm` `offload-w40` and `ours` with
-   timing; compare chunk time, host RSS, and PSNR against `compare-24082157`.
+3. Deferred until H2D stalls dominate (not at W40, see Status): a
+   `resident_layers` knob (keep the first M layers' history on device; trades
+   memory for H2D). Skipping the write range in prefetch only saves ~9% of
+   bytes and no wall time while fetch is hidden.
+4. Bank-as-only-store change: `compare.slurm` done (job 24131186, see
+   Status); `ci_gpu` `test_kvcache.py` still pending.
 5. Design a model-agnostic KV policy interface in `core` (storage tier +
    eviction/retrieval policy) and port window/sink, full, and offload onto it.
 6. Add chunk-level KV identity and a store/lookup path (LMCache-style reuse).

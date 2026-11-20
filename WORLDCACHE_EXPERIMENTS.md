@@ -137,13 +137,26 @@ sbatch --dependency=afterany:$A --export=ALL,RUNS="offload-w40 ours" experiments
 | `compare-1116-1310` | ours | 4.77 / 7.70 | 3.36 | 22.5 | 50.9 | 13.46 / 0.556 |
 | `compare-24082157`（timing） | offload-w40 | 5.10 / 5.34 | 3.14 | 22.3 | 20.9 | 13.67 / 0.565 |
 | `diag-1117-1048`（timing + H2D） | ours | 4.81 / 5.84 | 3.33 | 22.5 | 50.9 | 13.49 / 0.559 |
+| `compare-1118-1550`（`99b072de`，bank 作为唯一 host 存储，timing） | offload-w40 | 3.29 / 5.22 | 4.86 | 22.3 | 22.5 | 13.15 / 0.557 |
+| `compare-1118-1550`（同上） | ours | 3.74 / 6.52 | 4.28 | 22.5 | 39.5 | 13.41 / 0.558 |
 
 结果目录在 Delta 的 `/work/nvme/bicu/ytian6/kv_offload/` 下。
 
 结论与待办：
-- offload-w40 的 5.1 s/chunk 里约 1.84 s 是 host 上的滚窗（`roll` 日志）。2026-11-18 的「bank 作为唯一 host 存储」
-  改动（`WORLDCACHE_IMPL.md` §6）应该把这部分降到约 0，同时让 `ours` 的 host RSS 明显下降。
-  **在新节点上第一件事**：带 `FLASHDREAMS_KV_OFFLOAD_TIMING=1` 跑 `RUNS="offload-w40 ours"`，与上表对照。
+- 改动前 offload-w40 的 5.1 s/chunk 里约 1.84 s 是 host 上的滚窗（`roll` 日志）。「bank 作为唯一 host 存储」
+  （`WORLDCACHE_IMPL.md` §6，job 24131186）之后 `roll` < 2 ms：offload-w40 5.10 → 3.29 s/chunk，
+  ours 4.81 → 3.74 s/chunk，ours host RSS 50.9 → 39.5 GiB。第 0 个 chunk 的 `begin_chunk` 包含一次性的
+  pinned bank 分配（ours 17.5 s，offload-w40 8.6 s），属于 warmup。
+- 质量：同一配置重复跑的视频之间 PSNR 只有约 22–25 dB（编译 / autotune 带来的非确定性），revisit PSNR
+  在 13.15–13.67 之间波动，改动前后的差异在噪声范围内。
+- 稳态每层 fetch（offload-w40 17.4 ms，ours 20.5 ms）≈ compute（18.1 / 20.7 ms），H2D 已跑到 pinned 峰值
+  约 24.5 GB/s，但被 compute 掩盖：每次 forward 的 stall 只有 39 / 54 ms（约 7%），offload-w40 只比 resident-w40
+  慢 4%（3.29 vs 3.15 s/chunk）。所以现在**不是** H2D 瓶颈，去掉 `_prefetch` 的 `ponytail:` 暂不做；
+  拷贝量随可见长度线性增长，窗口更长或 compute 更快时才会成为瓶颈（第 4 节的交叉点）。
+- ours 比 offload-w40 慢 0.45 s/chunk，完全来自多出的 8 个检索帧（两者 window 都是 40）：attention 覆盖
+  54 vs 46 帧，每次 forward 拷贝 15.0 vs 12.8 GB（比值 = 54/46），compute 多 78 ms × 每 chunk 5 次 forward
+  ≈ diffuse 多出的 0.40 s；检索本身的 host 开销可忽略。
+- 统计稳态要取窗口填满后（chunk ≥ 12）的 forward，混入填充阶段会把每层时间算低。
 - baseline 还没有有效结果：在热缓存下重跑，或者调大 `RUN_TIMEOUT`。
 
 ---

@@ -1,7 +1,7 @@
 # WorldCache 实现索引（代码位置 + 行号）
 
 `WORLDCACHE.md` 记录目标/状态/下一步；本文件记录**每个已实现组件改在了哪里**，
-精确到文件与行号。行号基于分支 `kv-offload-sweep` 的 `711ff4f5` 加上「bank 作为唯一 host 存储」改动（§6，2026-11-18，未提交）。
+精确到文件与行号。行号基于分支 `kv-offload-sweep` 的 `99b072de`（「bank 作为唯一 host 存储」改动见 §6，`8c4a9932`）。
 **每新增或修改一个组件，都要在本文件追加/更新对应小节和行号**（见文末「维护规则」）。
 
 ---
@@ -266,7 +266,7 @@ H2D 字节数不变（每层每条目一次拷贝，frame 粒度下拷贝调用�
 对应 `WORLDCACHE.md` → Next Steps：
 
 - [x] host home 与 bank 合并、窗口 = bank 索引（§6）
-- [ ] 去掉 `_prefetch` 的 `ponytail:` 上限：预取跳过写入范围 / 同一 chunk 的去噪步间保留历史（`kvcache.py` `_prefetch` 1053–1089、`after_layer` 1021–1046）
+- [ ] （暂缓，job 24131186 显示 W40 下 fetch 被 compute 掩盖）`_prefetch` 的 `ponytail:` 上限：两个 slot 下跨去噪步保留历史等于全层常驻，可行的是 `resident_layers` 开关（前 M 层常驻显存）；跳过写入范围只省约 9% 字节（`kvcache.py` `_prefetch` 1053–1089、`after_layer` 1021–1046）
 - [ ] `core` 中模型无关的 KV policy 接口（存储层级 + 驱逐/检索策略），把 window/sink、full、offload 迁移上去
 - [ ] chunk 级 KV identity（chunk index、相机位姿、prompt）与 store/lookup 路径
 - [ ] 多 session / 显存预算 / 每 chunk 延迟
