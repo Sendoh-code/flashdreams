@@ -5,12 +5,14 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import torch
 import torch.nn as nn
 from einops import rearrange
+from loguru import logger
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
@@ -45,11 +47,19 @@ class WanDiTNetworkCache:
 
     def before_update(self, chunk_idx: int) -> None:
         """Run pre-update hooks for all block caches."""
+        timing = self.kv_offload is not None and self.kv_offload._timing
+        t0 = time.perf_counter()
         if self.kv_offload is not None:
-            # The window roll mutates host homes still targeted by async copies.
+            # Bank eviction hands host rows still targeted by async copies to the new chunk.
             self.kv_offload.begin_chunk(chunk_idx)
+        t1 = time.perf_counter()
         for block_cache in self.block_caches:
             block_cache.before_update(chunk_idx)
+        if timing:  # host-side cost outside the per-layer CUDA events
+            logger.info(
+                "kv_offload chunk {} before_update: begin_chunk {:.1f} ms, roll {:.1f} ms",
+                chunk_idx, (t1 - t0) * 1e3, (time.perf_counter() - t1) * 1e3,
+            )
 
     def after_update(self, chunk_idx: int) -> None:
         """Run post-update hooks for all block caches."""

@@ -1,16 +1,17 @@
 # WorldCache 实现索引（代码位置 + 行号）
 
 `WORLDCACHE.md` 记录目标/状态/下一步；本文件记录**每个已实现组件改在了哪里**，
-精确到文件与行号。行号基于分支 `kv-offload-sweep` 上 KV bank / RoPE 提交（`944cdf13` 之后的下一个提交，2026-11-13）。
+精确到文件与行号。行号基于分支 `kv-offload-sweep` 的 `99b072de`（「bank 作为唯一 host 存储」改动见 §6，`8c4a9932`）。
 **每新增或修改一个组件，都要在本文件追加/更新对应小节和行号**（见文末「维护规则」）。
 
 ---
 
 ## 1. Layerwise host KV offload（offload + fetch + 逐层重叠）
 
-引入于 `0712e9b7`。核心思想：每层 self-attention 的 K/V「家」在 pinned host
+引入于 `0712e9b7`。核心思想：每层 self-attention 的 K/V 在 pinned host
 内存，GPU 上只有两个 slot（双缓冲）。第 `i` 层计算时，side stream 把第 `i+1`
-层 H2D 拷进另一个 slot；第 `i` 层算完后只把本次写入的 chunk D2H 写回 host。
+层 H2D 拼进另一个 slot；第 `i` 层算完后只把本次写入的 chunk D2H 写回 host。
+host 侧只有 sink buffer + `KVBank` 条目（§6），不再有整层 home。
 
 ### 1.1 核心类 `LayerwiseKVOffload`
 
@@ -18,25 +19,24 @@
 
 | 行号 | 内容 | 说明 |
 | --- | --- | --- |
-| 8–15 | `json` / `os` / `statistics` / `nullcontext` / `TYPE_CHECKING` 等 import | 为 offload、计时、bank 类型注解新增 |
-| 22–23 | `if TYPE_CHECKING: from ...kvbank import KVBank` | 避免与 `kvbank.py` 循环 import |
-| 892–924 | 类定义 + docstring | 用法：`before_layer → block → after_layer`；920–923 说明 bank 行为 |
-| 926–938 | `__init__(bank=None)` | `bank`（927，可选 `KVBank`）、`_slots`（2 个 GPU K/V 槽）、`_ready`（每槽一个 CUDA event）、`_home`（`id(cache)→` pinned host K/V）、`_stream`（side stream）、计时状态 |
-| 940–966 | `add(cache)` | **offload**：前两个 cache 的 GPU buffer 直接复用为 slot（保留 LingBot TMA padding 等自定义布局，949）；之后每个 cache 分配 pinned host home（958–962），并把 `cache._k/_v` 换成 home（964）；有 bank 时同时 `bank.add(cache)`（965–966）。形状不一致直接报错（953–957） |
-| 968–976 | `synchronize()` | `self._stream.synchronize()` 等待所有异步拷贝；顺带结算挂起的计时 |
-| 978–982 | `begin_chunk(chunk_idx)` | 先 `synchronize()`，再 `bank.begin_chunk`（分配/驱逐 entry 要求无拷贝在途） |
-| 984–988 | `reset()` | 同步后清空 bank entry（存储不释放） |
-| 990–1005 | `before_layer(caches, i)` | **fetch + 重叠**：`i==0` 时先预取第 0 层（993–994）；预取第 `i+1` 层到 slot `(i+1)%2`（995–998）；计算流 `wait_event(_ready[i%2])`（1001）；把 cache 绑定到 GPU slot（1005） |
-| 1007–1032 | `after_layer(caches, i)` | **write-back**：side stream `wait_stream(当前计算流)`（1017）；只拷 `_current_write_bounds()` 写入范围回 host（1012, 1021–1022）；有 bank 时再把当前 chunk 拷进 bank（1023–1026）；cache 绑回 host home（1029） |
-| 1034–1037 | `_side_stream()` | CPU（无 CUDA）时退化为 `nullcontext`，拷贝变同步，便于 CPU 测试 |
-| 1039–1075 | `_prefetch(caches, i)` | 拷 `[0, cache.size)` 可见前缀到 slot；有 bank 检索结果时，retrieve 区由 `bank.fetch` 填充，home 只拷其余两段（1047–1060）；然后 `_ready[slot].record(stream)`（1068）。`ponytail:`（1040–1043）：每个去噪步重拷整段历史，是已知 H2D 带宽上限 |
-| 1077–1081 | `_record()` | 创建并记录带计时的 CUDA event |
-| 1083–1136 | `_log_forward()` | 每次 forward 汇总每层 `fetch_ms / stall_ms / compute_ms / writeback_ms / fetch_mb`；`stall`（1096–1100）；可写 JSONL（1112–1118） |
-| 1139– | `__all__` | 导出 `LayerwiseKVOffload` |
+| 8–21 | `json` / `os` / `statistics` / `nullcontext` 等 import；21 运行时 `from ...kvbank import KVBank, KVBankConfig` | `kvbank.py` 只在 `TYPE_CHECKING` 下 import `kvcache`，无循环 |
+| 890–925 | 类定义 + docstring | host 布局（sink buffer + bank）、meta 绑定、用法；每个 forward 前必须 `begin_chunk` |
+| 927–941 | `__init__(bank=None)` | `bank`（调用方的 bank，可为 None，LingBot 用它 `annotate`）、`_bank`（实际存储，`add` 时缺省建一个）、`_slots`、`_ready`、`_sink`（`id(cache)→` pinned sink K/V）、`_idle`（`id(cache)→` meta K/V）、`_stream`、计时状态 |
+| 943–980 | `add(cache)` | 前两个 cache 的 GPU buffer 复用为 slot（保留 LingBot TMA padding）；形状不一致报错；无 bank 时建**只装窗口**的 token 单位 bank（961–969）；分配 `sink_size` 长的 pinned sink buffer（971–976）；`cache._k/_v` 换成 meta tensor（977–980） |
+| 982–990 | `synchronize()` | 等 side stream；结算计时 |
+| 992–996 | `begin_chunk(chunk_idx)` | `synchronize()` 后 `_bank.begin_chunk`（驱逐把 host 行交给新 chunk，必须无拷贝在途） |
+| 998–1002 | `reset()` | 同步后清空 bank 条目 |
+| 1004–1019 | `before_layer(caches, i)` | 预取 `i+1` 层；计算流 `wait_event(_ready[slot])`（1015）；绑定 GPU slot |
+| 1021–1046 | `after_layer(caches, i)` | `wait_stream`（1032）；写入范围落在 sink 内的部分拷回 sink buffer；当前 chunk 经 `_bank.store` 拷进 bank 行（1040）；cache 绑回 meta（1044） |
+| 1048–1051 | `_side_stream()` | 无 CUDA 时退化为 `nullcontext` |
+| 1053–1089 | `_prefetch(caches, i)` | slot = retrieve 区（`bank.fetch`）+ 窗口（`bank.window`，1070）+ sink buffer 其余两段；`_ready[slot].record`（1082）。`ponytail:`（1055–1058）：每个去噪步重拷整段历史 |
+| 1091–1094 | `_record()` | 计时 CUDA event |
+| 1096–1150 | `_log_forward()` | 每层 `fetch_ms / stall_ms / compute_ms / writeback_ms / fetch_mb`；JSONL（1126） |
+| 1153– | `__all__` | |
 
-依赖的 `BlockKVCache` 已有方法（未改动）：
-`size`（602），`_seq_slice`（657），`_current_write_bounds`（697），
-`before_update`（768）中的窗口左滚 `_roll_local_window_left`（663，在 host home 上执行）。
+依赖的 `BlockKVCache` 方法（未改动）：
+`size`（600），`_seq_slice`（655），`_current_write_bounds`（695），
+`before_update`（766）中的窗口左滚 `_roll_local_window_left`（661）——offload 下它作用在 meta tensor 上，不搬任何内存。
 
 导出：`flashdreams/flashdreams/core/attention/__init__.py` 中 import 与 `__all__` 各加一行 `LayerwiseKVOffload`。
 
@@ -55,9 +55,9 @@ compute     :          wait r0 [layer 0]    wait r1 [layer 1]    wait r2 ...
 - **计算等数据**：计算流只在 `_ready[slot]` event 上等待（1001），其余时间与 H2D 并行。
 - **跨 forward**：同一 chunk 的多个去噪步、CFG cond/uncond 共享同一个 offload 和两个 slot；
   side stream 的顺序保证上一 forward 最后的 write-back 先于下一 forward 的 fetch。
-- **host 侧修改前必须同步**：窗口左滚直接改 host home，所以
-  `WanDiTNetworkCache.before_update` 先调 `begin_chunk()`（内含 `synchronize()`，见 1.3）。
-- **不兼容 CUDA graph**：slot 重绑定（Python 侧换 tensor）+ side stream；`@torch.compiler.disable`（990, 1007）。
+- **驱逐前必须同步**：bank 驱逐把 host 行交给新 chunk，所以
+  `WanDiTNetworkCache.before_update` 先调 `begin_chunk()`（内含 `synchronize()`，见 1.3）。窗口左滚本身已不碰 host 内存（meta）。
+- **不兼容 CUDA graph**：slot 重绑定（Python 侧换 tensor）+ side stream；`@torch.compiler.disable`（1004, 1021）。
 
 ### 1.3 Wan recipe 接线
 
@@ -65,13 +65,13 @@ compute     :          wait r0 [layer 0]    wait r1 [layer 1]    wait r2 ...
 
 | 行号 | 内容 |
 | --- | --- |
-| 17 | `from flashdreams.core.attention import LayerwiseKVOffload` |
-| 39 | `WanDiTNetworkCache.kv_offload` 字段 |
-| 46–52 | `before_update`：offload 存在时先 `kv_offload.begin_chunk()`（48–50），再逐 block 滚窗口 |
-| 59–64 | `reset`：先 `kv_offload.reset()`（61–62） |
-| 330, 340 | `initialize_cache(..., kv_offload=None)` 参数与文档 |
-| 362–363 | 每建一个 block cache 立刻 `kv_offload.add(block_cache.self_attn)`，峰值显存只到几层 |
-| 522–537 | forward 中的逐层 hook：`before_layer` / `after_layer` 包住每个 block |
+| 19 | `from flashdreams.core.attention import LayerwiseKVOffload` |
+| 41 | `WanDiTNetworkCache.kv_offload` 字段 |
+| 48–62 | `before_update`：offload 存在时先 `kv_offload.begin_chunk()`（52–54），再逐 block 滚窗口；`FLASHDREAMS_KV_OFFLOAD_TIMING=1` 时打印 `begin_chunk` / `roll` 的 host 耗时（57–62） |
+| 69–72 | `reset`：先 `kv_offload.reset()` |
+| 340 | `initialize_cache(..., kv_offload=None)` 参数 |
+| 372–373 | 每建一个 block cache 立刻 `kv_offload.add(block_cache.self_attn)`，峰值显存只到几层 |
+| 534–547 | forward 中的逐层 hook：`before_layer` / `after_layer` 包住每个 block |
 
 `flashdreams/flashdreams/recipes/wan/transformer/wan21.py`
 
@@ -95,10 +95,10 @@ compute     :          wait r0 [layer 0]    wait r1 [layer 1]    wait r2 ...
 
 ### 1.5 计时 / 观测
 
-- 环境变量：`FLASHDREAMS_KV_OFFLOAD_TIMING=1`（kvcache.py:933），
-  `FLASHDREAMS_KV_OFFLOAD_TIMING_JSONL=<path>`（kvcache.py:1112）。
-- 事件记录点：fetch（1064, 1071–1075），compute（1004, 1015），writeback（1020, 1028）。
-  `fetch_mb` 包含 bank 检索拷贝（1070）。
+- 环境变量：`FLASHDREAMS_KV_OFFLOAD_TIMING=1`（kvcache.py:936），
+  `FLASHDREAMS_KV_OFFLOAD_TIMING_JSONL=<path>`（kvcache.py:1126）。
+- 事件记录点在 `_prefetch` / `before_layer` / `after_layer` 内；`fetch_mb` 包含 sink、检索和窗口三类拷贝。
+- 每 chunk 的 host 侧 `begin_chunk` / `roll` 耗时：Wan `network.py:57–62` 的日志行。
 
 ### 1.6 测试
 
@@ -106,8 +106,8 @@ compute     :          wait r0 [layer 0]    wait r1 [layer 1]    wait r2 ...
 
 | 行号 | 测试 |
 | --- | --- |
-| 182–233 | `test_layerwise_offload_matches_resident_caches`（`ci_cpu`）：3 层、6 个 chunk（越过 sink 触发滚窗）、每 chunk 2 个去噪步，逐步对比 offload 与常驻 cache 的 `cached_k/v` |
-| 361–415 | `test_layerwise_offload_timing_reports_every_layer`（`ci_gpu`）：每层都有 fetch/compute 计时，`fetch_mb` 符合预期，JSONL 内容一致 |
+| 181–237 | `test_layerwise_offload_matches_resident_caches`（`ci_cpu`）：参数化 `(sink, window)` ∈ (2,4)/(1,4)/(0,5)/(1,5)，含 sink、window 与 chunk 不对齐；3 层、6 个 chunk、每 chunk 2 个去噪步，逐步对比 offload 与常驻 cache 的 `cached_k/v`；最后断言 cache 是 meta、sink buffer 长度 = sink、bank 容量 = ⌈window/chunk⌉ |
+| 367–422 | `test_layerwise_offload_timing_reports_every_layer`（`ci_gpu`）：每层都有 fetch/compute 计时，`fetch_mb` 符合预期，JSONL 内容一致 |
 
 ---
 
@@ -124,8 +124,8 @@ compute     :          wait r0 [layer 0]    wait r1 [layer 1]    wait r2 ...
 
 ## 3. KV bank（预算化 host K/V 存储 + 元数据检索）
 
-思想：offload 写回时，把每个 chunk（或每个 latent frame）额外存进一个按预算分配的
-pinned host bank，并带上元数据（位姿、动作……）。每个 chunk 开始时，可插拔的
+思想：offload 写回时，把每个 chunk（或每个 latent frame）存进一个按预算分配的
+pinned host bank，并带上元数据（位姿、动作……）。bank 也是窗口的唯一 host 副本（§6）。每个 chunk 开始时，可插拔的
 `KVRetrievalPolicy` 从「已离开 sink 和窗口」的条目中选 k 个，prefetch 时拷进
 cache 的 **retrieve 区**。每层 attention 看到 `[sink | retrieved | recent window]`。
 retrieve 区就是 `BlockKVCache` sink 的尾部，所以窗口滚动不会动它。
@@ -134,28 +134,29 @@ retrieve 区就是 `BlockKVCache` sink 的尾部，所以窗口滚动不会动�
 
 | 行号 | 内容 | 说明 |
 | --- | --- | --- |
-| 29–46 | `KVBankEntry` | `chunk_idx`、`frame`（全局 latent 帧号）、`num_frames`、`meta`、`slot`（bank 存储行，查询为 -1） |
-| 50–72 | `KVRetrievalPolicy.select(bank, query, candidates, k)` | 策略基类；candidates 已去掉 sink 和窗口内条目，按时间从旧到新 |
-| 76–86 | `RecentRetrieval` | 取最新 k 个，相当于更长的滑窗；默认策略 |
-| 90–126 | `CameraPoseRetrieval` | `meta["poses"]` 每条目平均位姿；平移 L2 + 旋转测地距离，各自 max 归一化后按 `translation_weight` 加权，取 top-k 最近（与 WorldKV `image2video_fast.py` 一致） |
-| 130–143 | `KVBankConfig` | `budget_gb`、`granularity`（`chunk`/`frame`）、`retrieve_size_t`（patchify 前帧数，须为条目大小的整数倍）、`policy` |
-| 156–185 | `KVBank.__init__` | `entry_frames`、`k = retrieve_size_t / entry_frames`；倍数校验（167–171） |
-| 187–198 | `add` / `entry_tokens` / `memory_start` | `memory_start = sink_size - k * entry_tokens`，即 retrieve 区起点 |
-| 200–211 | `reset` / `capacity` | |
-| 213–244 | `begin_chunk(chunk_idx)` | 为当前 chunk 分配条目（真 sink 内的帧跳过，231–232）；满了 FIFO 驱逐（`ponytail:` 234–236） |
-| 246–278 | `annotate(chunk_idx, per_frame, **shared)` | 写入查询与条目元数据；`per_frame` 首维 = `frames_per_chunk`，frame 粒度时按帧切片 |
-| 280–298 | `plan()` | 每 chunk 算一次：窗口起点之前的条目作为候选 → `policy.select` → 按时间排序 |
-| 300–314 | `fetch(cache, slot_k, slot_v)` | 返回 retrieve 区的 `(dst, src)` H2D 拷贝 |
-| 316–330 | `store(cache)` | 返回把当前写入范围拷进 bank 行的 D2H 拷贝 |
-| 333–363 | `_allocate()` | 首次 `begin_chunk` 时按预算算容量（350 用 `round()`，`int()` 会把 239.99… B 截成少一个条目），为每个注册的 cache 分配 `[capacity, *entry_shape]` pinned K/V；要求 `window_size >= chunk_size` |
+| 30–47 | `KVBankEntry` | `chunk_idx`、`frame`（全局 latent 帧号）、`num_frames`、`meta`、`slot`（bank 存储行，查询为 -1） |
+| 51–73 | `KVRetrievalPolicy.select(bank, query, candidates, k)` | 策略基类；candidates 已去掉 sink 和窗口内条目，按时间从旧到新 |
+| 77–87 | `RecentRetrieval` | 取最新 k 个；默认策略 |
+| 91–127 | `CameraPoseRetrieval` | 平移 L2 + 旋转测地距离，max 归一化后加权取 top-k（与 WorldKV `image2video_fast.py` 一致） |
+| 131–147 | `KVBankConfig` | `budget_gb`（低于窗口所需时自动抬到窗口大小，`0` = 只装窗口）、`granularity`、`retrieve_size_t`、`policy` |
+| 150–189 | `KVBank.__init__` | `entry_frames`、`k = retrieve_size_t / entry_frames` |
+| 191–202 | `add` / `entry_tokens` / `memory_start` | `memory_start = sink_size - k * entry_tokens`，retrieve 区起点 |
+| 204–215 | `reset` / `capacity` | |
+| 217–259 | `begin_chunk(chunk_idx)` | 分配当前 chunk 的条目；只跳过**完全**在真 sink 内的条目（241，跨 sink 边界的 chunk 也存，因为它的尾部在窗口里）；满了 FIFO 驱逐（`ponytail:` 243），驱逐仍在窗口（235–238）内的条目时 `RuntimeError`（246–250） |
+| 261–293 | `annotate(chunk_idx, per_frame, **shared)` | 写入查询与条目元数据 |
+| 295–316 | `plan()` | 候选 = 起点 ≥ 真 sink（308）且整体在窗口之前的条目 → `policy.select` → 按时间排序 |
+| 318–332 | `fetch(cache, slot_k, slot_v)` | retrieve 区的 `(dst, src)` H2D 拷贝 |
+| 334–370 | `window(cache, slot_k, slot_v)` | **窗口 = bank 索引**：从最新条目倒序，按 rollout token 位置拼出 slot 的 `[sink_size, size)`；末尾断言覆盖的 token 数 = 窗口长度 |
+| 372–386 | `store(cache)` | 当前写入范围 → bank 行的 D2H 拷贝 |
+| 388–418 | `_allocate()` | 容量 = `max(round(budget)//entry_bytes, ⌈window_frames/entry_frames⌉)`（406–408） |
 
 导出：`flashdreams/flashdreams/core/attention/__init__.py` 7–14、`__all__` 加 6 个名字。
 
 ### 3.2 接入 offload（`kvcache.py`）
 
-`LayerwiseKVOffload(bank=...)`（926），`add` 注册（965–966），`begin_chunk` / `reset`（978–988），
-`after_layer` 存 bank（1023–1026），`_prefetch` 用 bank 填 retrieve 区，home 拷剩下两段（1047–1060）。
-检索不足 k 条时，retrieve 区剩余位置仍是 host home 的内容（即最早的 sink 之后几帧）。
+`LayerwiseKVOffload(bank=...)`（927），`add` 注册（969），`begin_chunk` / `reset`（992–1002），
+`after_layer` 存 bank（1040），`_prefetch` 用 bank 填 retrieve 区和窗口，sink buffer 拷剩下两段（1053–1089）。
+检索不足 k 条时，retrieve 区剩余位置是 sink buffer 的内容（即 filling 阶段写进去的、真 sink 之后几帧）。
 
 ### 3.3 Wan recipe 接线
 
@@ -182,11 +183,11 @@ retrieve 区就是 `BlockKVCache` sink 的尾部，所以窗口滚动不会动�
 
 | 文件:行号 | 测试 |
 | --- | --- |
-| `flashdreams/tests/test_kvcache.py:236–247` | `_MatchAction`：按动作匹配的测试策略 |
-| `test_kvcache.py:250–255` | `test_kv_bank_fills_retrieve_region`（`ci_cpu`）：chunk/frame × 无限/容量 2，10 个 chunk × 2 去噪步，逐层对照独立模型检查 attended K/V 与 FIFO 驱逐 |
-| `test_kvcache.py:258–264` | `test_kv_bank_fills_retrieve_region_cuda`（`ci_gpu`）：同上，CUDA side stream + pinned 存储 |
-| `test_kvcache.py:267–343` | `_check_kv_bank(granularity, capacity, device)` 共用主体 |
-| `test_kvcache.py:346–358` | `test_camera_pose_retrieval_picks_nearest_pose`（`ci_cpu`） |
+| `flashdreams/tests/test_kvcache.py:240–251` | `_MatchAction`：按动作匹配的测试策略 |
+| `test_kvcache.py:254–259` | `test_kv_bank_fills_retrieve_region`（`ci_cpu`）：chunk/frame × 无限/容量 2（frame 粒度时被抬到窗口的 4 条），10 个 chunk × 2 去噪步，逐层对照独立模型检查 attended K/V 与 FIFO 驱逐 |
+| `test_kvcache.py:262–268` | `test_kv_bank_fills_retrieve_region_cuda`（`ci_gpu`）：同上，CUDA side stream + pinned 存储 |
+| `test_kvcache.py:271–349` | `_check_kv_bank(granularity, capacity, device)` 共用主体 |
+| `test_kvcache.py:352–364` | `test_camera_pose_retrieval_picks_nearest_pose`（`ci_cpu`） |
 
 已知限制：FIFO 驱逐；每个去噪步都写 bank（只有最后一步有用）；`CameraPoseRetrieval` 把 batch 维也平均（B>1 不对）。
 
@@ -232,11 +233,40 @@ bank 原样存 cache 里的 K，所以不另设 bank 级开关，以免两个开
 
 ---
 
-## 6. 待实现组件（实现后在此追加小节，写清文件与行号）
+## 6. bank 作为唯一 host 存储（窗口 = bank 索引，2026-11-18）
+
+**问题**：offload 下 `cache._k/_v` 在两层之间指向整层 pinned host home，`before_update`
+的窗口左滚（`_roll_local_window_left`，`clone` + 回写）就在 CPU 上搬整个窗口：
+LingBot 1.3B W40/S6 实测每 chunk 约 1.84 s，占 5.1 s/chunk 的 36%
+（`/work/nvme/bicu/ytian6/kv_offload/compare-24082157/offload-w40/run.log`）。
+同时有 bank 时每个窗口 chunk 在 host 上存两份（home + bank），D2H 也写两次。
+
+**做法**：
+- host 只剩 per-cache 的 sink buffer（`sink_size` = 真 sink + retrieve 区）+ `KVBank` 条目；
+  没有调用方 bank 时，`add` 建一个 token 单位、只装窗口的 bank（kvcache.py 961–969）。
+- 两层之间 cache 绑 meta tensor（kvcache.py 977–980, 1044），`BlockKVCache` 的滚窗逻辑不改，只是不再碰内存。
+- prefetch 时 `KVBank.window`（kvbank.py 334–370）按 rollout token 位置
+  `g = p + (curr_chunk+1)·chunk_size − size` 从最新条目拼出 slot 的窗口区；slot 里仍是逻辑顺序，
+  所以 attention、pre/post-RoPE 都不用改。
+- 写回：写入范围在 sink 内的部分进 sink buffer，整个 chunk 进 bank（kvcache.py 1021–1046）。
+- bank 存储规则：只跳过完全在真 sink 内的条目；候选要求起点 ≥ 真 sink（与旧行为一致）；
+  容量至少 ⌈window/entry⌉；FIFO 驱逐窗口内条目直接报错。
+
+**预期**：滚窗 ~1.84 s → ~0；`ours`（W40/S6/R8，24 GB bank）host 内存从 ~15 GB home + 24 GB bank
+降到 ~4 GB sink + 24 GB bank（窗口已在 bank 预算内，可检索的旧条目相应少约 10 个 chunk）；D2H 减半。
+H2D 字节数不变（每层每条目一次拷贝，frame 粒度下拷贝调用数 ×4，未合并相邻行）。
+
+**测试**：§1.6 的参数化 parity 测试（含 sink/window 与 chunk 不对齐）与 §3.5 的 bank 测试；
+`uv run pytest -m ci_cpu flashdreams/tests/test_kvcache.py` 19 passed（2026-11-18，login node）。GPU 端到端尚未跑。
+
+---
+
+## 7. 待实现组件（实现后在此追加小节，写清文件与行号）
 
 对应 `WORLDCACHE.md` → Next Steps：
 
-- [ ] 去掉 `_prefetch` 的 `ponytail:` 上限：预取跳过写入范围 / 同一 chunk 的去噪步间保留历史（预计改 `kvcache.py` `_prefetch` 1010–1035、`after_layer` 982–1003）
+- [x] host home 与 bank 合并、窗口 = bank 索引（§6）
+- [ ] （暂缓，job 24131186 显示 W40 下 fetch 被 compute 掩盖）`_prefetch` 的 `ponytail:` 上限：两个 slot 下跨去噪步保留历史等于全层常驻，可行的是 `resident_layers` 开关（前 M 层常驻显存）；跳过写入范围只省约 9% 字节（`kvcache.py` `_prefetch` 1053–1089、`after_layer` 1021–1046）
 - [ ] `core` 中模型无关的 KV policy 接口（存储层级 + 驱逐/检索策略），把 window/sink、full、offload 迁移上去
 - [ ] chunk 级 KV identity（chunk index、相机位姿、prompt）与 store/lookup 路径
 - [ ] 多 session / 显存预算 / 每 chunk 延迟

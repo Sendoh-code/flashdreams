@@ -179,17 +179,22 @@ def test_clone_and_overwrite_kv_preserve_storage_addresses() -> None:
 
 
 @pytest.mark.ci_cpu
-def test_layerwise_offload_matches_resident_caches() -> None:
-    """Offloaded layers see the same K/V as resident ones through two slots."""
+@pytest.mark.parametrize("sink,window", [(2, 4), (1, 4), (0, 5), (1, 5)])
+def test_layerwise_offload_matches_resident_caches(sink: int, window: int) -> None:
+    """Offloaded layers see the same K/V as resident ones through two slots.
+
+    Host memory is only the sink plus a window-sized bank: the rolling window
+    is gathered from bank entries by index, including chunk-unaligned sinks.
+    """
 
     def make() -> BlockKVCache:
         return BlockKVCache(
-            k_shape=(1, 6, 1, 2),
-            v_shape=(1, 6, 1, 3),
+            k_shape=(1, sink + window, 1, 2),
+            v_shape=(1, sink + window, 1, 3),
             seq_dim=1,
             chunk_size=2,
-            window_size=4,
-            sink_size=2,
+            window_size=window,
+            sink_size=sink,
             device="cpu",
             dtype=torch.float32,
         )
@@ -206,7 +211,7 @@ def test_layerwise_offload_matches_resident_caches() -> None:
     # Six chunks roll the window past the sink; two writes per chunk mimic
     # denoising steps overwriting the same positions.
     for chunk_idx in range(6):
-        offload.synchronize()
+        offload.begin_chunk(chunk_idx)
         for cache in resident + offloaded:
             cache.before_update(chunk_idx)
         for _step in range(2):
@@ -226,11 +231,10 @@ def test_layerwise_offload_matches_resident_caches() -> None:
         for cache in resident + offloaded:
             cache.after_update(chunk_idx)
 
-    for ref, cache in zip(resident, offloaded, strict=True):
-        assert cache._k.data_ptr() not in slot_ptrs
-        visible = cache._seq_slice(0, cache.size)
-        torch.testing.assert_close(cache._k[visible], ref._k[visible])
-        torch.testing.assert_close(cache._v[visible], ref._v[visible])
+    for cache in offloaded:
+        assert cache._k.is_meta and cache._v.is_meta
+        assert offload._sink[id(cache)][0].shape[1] == sink
+    assert offload._bank is not None and offload._bank.capacity == -(-window // 2)
 
 
 class _MatchAction(KVRetrievalPolicy):
@@ -271,6 +275,8 @@ def _check_kv_bank(granularity: str, capacity: int | None, device: str) -> None:
     # One entry is ``entry`` tokens of K (2 ch) + V (3 ch) float32 per layer.
     entry_bytes = layers * entry * (2 + 3) * 4
     budget = (capacity or 1000) * entry_bytes / 1e9
+    # The bank also holds the window, so a smaller budget is raised to it.
+    capacity = capacity and max(capacity, window // entry)
     bank = KVBank(
         KVBankConfig(
             budget_gb=budget,
@@ -314,7 +320,7 @@ def _check_kv_bank(granularity: str, capacity: int | None, device: str) -> None:
 
         # Independent model of the expected window.
         window_frames = list(range(max(sink + retrieve, frames[-1] + 1 - window), frames[-1] + 1))
-        memory = list(range(sink, sink + retrieve))  # host home's copy
+        memory = list(range(sink, sink + retrieve))  # sink buffer's copy
         if frames[0] >= sink + retrieve:
             picked = [
                 f for f in stored
@@ -382,6 +388,7 @@ def test_layerwise_offload_timing_reports_every_layer(
     offload = LayerwiseKVOffload()
     for cache in caches:
         offload.add(cache)
+    offload.begin_chunk(0)
     for cache in caches:
         cache.before_update(0)
     chunk = torch.randn(1, 1024, 8, 64, device="cuda", dtype=torch.bfloat16)
