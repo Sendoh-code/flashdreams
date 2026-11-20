@@ -1055,8 +1055,7 @@ class LayerwiseKVOffload:
         # ponytail: copies the whole visible prefix (including the chunk this
         # forward overwrites) on every denoising step, because two slots
         # cannot hold history across a full network pass. Hidden behind
-        # compute at W40 on A100; bytes grow with visible length. If H2D
-        # stalls dominate, keep the first M layers resident on device.
+        # compute at W40 on A100.
         cache = caches[index]
         slot = index % 2
         slot_k, slot_v = self._slots[slot]
