@@ -19,13 +19,30 @@ git clone git@github.com:cvlab-kaist/WorldKV.git WorldKV && git -C WorldKV check
 
 | 依赖 | 用途 | 检查 |
 | --- | --- | --- |
-| `ffmpeg` 在 PATH | mp4 输出、`bank_test` 的 PSNR | `ffmpeg -version`（Delta 上脚本自动 `module load ffmpeg/7.1`） |
+| `ffmpeg` 在 PATH | mp4 输出、`bank_test` 的 PSNR | `ffmpeg -version`（Delta 上脚本自动 `module load ffmpeg/7.1`；没有 sudo 时用 lockfile 里的 `imageio-ffmpeg`，见下方） |
+| `imageio`、`av` | `compare_metrics.py` 读 mp4 | `uv sync` 不会装；缺了 `metrics.log` 报 `No module named 'imageio'` |
 | `/usr/bin/time` | `compare.slurm` 记录 host 峰值 RSS | `/usr/bin/time -v true` |
 | `numactl`（可选） | `sweep.slurm` 和 `H2D_BENCH=1` 绑定 GPU 所在的 NUMA 节点 | `numactl -H` |
 | HF 权重约 29 GB | `robbyant/lingbot-world-v2-1.3b-causal-fast`、`Wan-AI/Wan2.1-T2V-1.3B-Diffusers`、`lightx2v/Autoencoders`，首次运行自动下载 | 需要时 `export HF_TOKEN=...` |
 
-已验证环境：torch 2.12.1+cu130、Python 3.12.16；A40 48 GB（sm86）和 A100-SXM4 40 GB。
-sm86 / A100 没有 FP8，所以 `kv_sweep` app 固定用 bf16 `torch` linear 和 `wan` attention。
+已验证环境：torch 2.12.1+cu130、Python 3.12.16；A40 48 GB（sm86）、A100-SXM4 40 GB，
+以及 RTX PRO 6000 Blackwell Server Edition 96 GB（sm120，2026-11-20 起的独占实验机，无 Slurm）。
+sm86 / A100 没有 FP8，所以 `kv_sweep` app 固定用 bf16 `torch` linear 和 `wan` attention
+（RTX PRO 6000 上也保持 bf16，以便和历史数据对比）。
+
+RTX PRO 6000 上的补充步骤（无 sudo、无 Slurm）：
+
+```bash
+uv pip install --python .venv/bin/python imageio-ffmpeg==0.6.0 imageio==2.37.3 av==16.1.0  # 版本取自 uv.lock
+mkdir -p .venv/ffbin && ln -sf "$(.venv/bin/python -c 'import imageio_ffmpeg;print(imageio_ffmpeg.get_ffmpeg_exe())')" .venv/ffbin/ffmpeg
+export PATH=$PWD/.venv/ffbin:$PATH HF_HUB_DOWNLOAD_TIMEOUT=60
+```
+
+- 首次下载 `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` 的 umT5 分片时，Xet 传输在文件已完整写入后卡住
+  （连接 `CLOSE-WAIT`，进程 0% CPU，不报错）。处理：杀掉进程，对 `blobs/*.incomplete` 做 `sha256sum`，
+  与文件名（LFS oid）一致就去掉 `.incomplete` 后缀，再跑一次 `snapshot_download` 补 snapshot 链接。
+- Triton autotune 会打印 `out of resource ... Hardware limit:101376`（sm120 每 SM 共享内存约 99 KB），
+  只是跳过该配置，不影响运行。
 
 ### 0.1 路径变量（脚本默认写死为 Delta 路径，换节点必须覆盖）
 
@@ -127,6 +144,12 @@ sbatch --dependency=afterany:$A --export=ALL,RUNS="offload-w40 ours" experiments
 | `sharpness` / `sharpness_late_over_early` | Laplacian 清晰度，以及最后四分之一 / 最前四分之一的比值（越低说明越来越糊） |
 | `psnr_vs_baseline` | 与 baseline 视频的差异程度（只说明偏离，不代表质量） |
 
+**注意 UI 面板**：flashdreams 录出的 `out.mp4` 左上角烧进了 cam2v 的 "Camera controls" 面板
+（x < 约 0.45 W，文字会变），码率约 4.5 Mbps（官方 LingBot 视频没有面板，约 15 Mbps）。
+所有视频指标默认只用 x ≥ `--x0` × W 的部分（`--x0` 默认 0.5，传 `--x0 0` 用整帧）。
+2026-11-24 之前的数字都是整帧算的：revisit PSNR 被面板抬高约 1.5 dB，`sharpness_late_over_early`
+被面板文字拉到接近 1，掩盖了画面变糊。
+
 **历史结果**（A100-SXM4-40GB，commit `711ff4f5`，208 个 revisit pair）：
 
 | 来源 | run | chunk s（中位 / p90） | fps | GPU GiB | host RSS GiB | revisit PSNR / SSIM |
@@ -140,7 +163,28 @@ sbatch --dependency=afterany:$A --export=ALL,RUNS="offload-w40 ours" experiments
 | `compare-1118-1550`（`99b072de`，bank 作为唯一 host 存储，timing） | offload-w40 | 3.29 / 5.22 | 4.86 | 22.3 | 22.5 | 13.15 / 0.557 |
 | `compare-1118-1550`（同上） | ours | 3.74 / 6.52 | 4.28 | 22.5 | 39.5 | 13.41 / 0.558 |
 
-结果目录在 Delta 的 `/work/nvme/bicu/ytian6/kv_offload/` 下。
+以上 A100 结果目录在 Delta 的 `/work/nvme/bicu/ytian6/kv_offload/` 下。
+
+**RTX PRO 6000 Blackwell 结果**（96 GB，sm120，commit `4049e1d4`，bf16，timing 开启，208 个 revisit pair；
+目录 `/mnt/datastore/yiti6755/kv_offload/compare-1120-rtx6000/`）。p90 含前两个 chunk 之外的编译抖动，
+baseline / resident-w40 的 p90 偏大是因为它们先跑、编译缓存还是冷的：
+
+| GPU | run | chunk s（中位 / p90） | fps | GPU GiB | host RSS GiB | revisit PSNR / SSIM |
+| --- | --- | --- | --- | --- | --- | --- |
+| RTX PRO 6000 | baseline | 1.16 / 59.7 | 13.81 | 26.4 | 18.2 | 15.70 / 0.552 |
+| RTX PRO 6000 | resident-w40 | 2.04 / 28.0 | 7.83 | 33.6 | 18.2 | 15.66 / 0.559 |
+| RTX PRO 6000 | offload-w40 | 2.08 / 5.63 | 7.70 | 22.4 | 23.1 | 15.58 / 0.579 |
+| RTX PRO 6000 | ours | 2.32 / 4.49 | 6.89 | 22.5 | 39.9 | 15.53 / 0.570 |
+
+上表 revisit 是整帧算的；遮掉面板（x ≥ 0.5 W）后 baseline / resident-w40 / offload-w40 / ours 是
+14.49 / 14.29 / 14.51 / 14.43 dB（SSIM 0.387 / 0.392 / 0.426 / 0.415），仍在噪声范围内。
+整帧版本保存在同目录的 `metrics_fullframe.{json,md}`。
+
+RTX PRO 6000 稳态逐层计时（窗口填满后的 forward，30 层）：offload-w40 fetch 7.40 / compute 11.85 ms
+（比值 0.62），ours 8.69 / 13.66 ms（0.64）；每次 forward stall 7.4 / 8.7 ms（约 2.1%），H2D 57.6 GB/s，
+每次 forward 拷贝 12.8 / 15.0 GB。offload-w40 只比 resident-w40 慢 1.7%。**compute 仍掩盖 fetch，
+余量比 A100 更大**（带宽是 A100 的 2.4 倍，bf16 compute 只快 1.5 倍）。sm120 有 FP8，换 FP8 后 compute
+变短，需要重测。
 
 结论与待办：
 - 改动前 offload-w40 的 5.1 s/chunk 里约 1.84 s 是 host 上的滚窗（`roll` 日志）。「bank 作为唯一 host 存储」
@@ -157,7 +201,42 @@ sbatch --dependency=afterany:$A --export=ALL,RUNS="offload-w40 ours" experiments
   54 vs 46 帧，每次 forward 拷贝 15.0 vs 12.8 GB（比值 = 54/46），compute 多 78 ms × 每 chunk 5 次 forward
   ≈ diffuse 多出的 0.40 s；检索本身的 host 开销可忽略。
 - 统计稳态要取窗口填满后（chunk ≥ 12）的 forward，混入填充阶段会把每层时间算低。
-- baseline 还没有有效结果：在热缓存下重跑，或者调大 `RUN_TIMEOUT`。
+- A100 上 baseline 还没有有效结果：在热缓存下重跑，或者调大 `RUN_TIMEOUT`。
+  RTX PRO 6000 上 baseline 已有结果（上表，`RUN_TIMEOUT=3600`）。
+
+### 2.1 窗口长度实验与官方对照（RTX PRO 6000，2026-11-20 至 11-24）
+
+**窗口长度实验**：`/mnt/datastore/yiti6755/kv_offload/win-study/`，驱动脚本 `run.sh`，汇总脚本
+`aggregate.py`（`python3 aggregate.py . > results.md`）。seed 42/43/44，每个 seed 跑一遍 `compare.slurm`：
+`baseline`（W12）、`res-w16…w84`、`ret-w8-r8/r16/r24`。遮掉面板后的结论：
+
+- resident 窗口 12–84：revisit PSNR 13.7–14.2 dB，std 0.5–1.0，没有趋势。
+- 总长 T 相同时，检索 `ret-w8-r<T-8>` 对比滑窗 `res-w<T>`（同 seed 配对）：far pair（间隔 ≥ 200 帧）
+  分别 +0.45 / +0.27 / +0.34 dB（T = 16 / 24 / 32），9 对里 7 对检索更好；显存 22 vs 27–31 GiB，
+  速度只慢 2–3%。信号弱，需要更多 seed 和干净录制（关掉 overlay、提高码率）才能下结论。
+
+**WorldKV 官方代码复现**（14B `lingbot-world-base-cam`，不是 1.3B）：`WorldKV/repro/run.sh`，结果在
+`WorldKV/repro/out/results.md`（gitignored）。窗口 18 时，检索（`worldkv` / `wr9`）比同长滑窗
+`sink3-recent15` 高约 0.9 dB，3 个 seed 都赢；去掉 sink 的 `fifo18` 差 3 dB 以上。
+
+**相机跟随对照（官方 LingBot-World-V2 1.3B vs flashdreams）**：`/mnt/datastore/yiti6755/lingbot-upstream/`。
+`SEEDS="42 43 44" bash run_ab.sh` 用官方 `generate.py`（upstream `1895d30` + SDPA fallback）在相同输入
+（example 00 图片/prompt/内参 + `R_L_R_L_R_L90_360` 位姿，`local_attn_size 18`、`sink_size 6`）上生成，
+已有视频不重跑，然后跑 `flow_yaw.py`。`flow_yaw.py` 用 Farneback 光流估计每帧 yaw，`homog_yaw.py`
+用 ORB 匹配加单应矩阵交叉检查，两者都只看 x ≥ 0.5 W。
+
+| | 相关系数 | 增益（实际 / 命令 yaw） |
+| --- | --- | --- |
+| flashdreams baseline | 0.83 | 0.99（0.98 / 0.95 / 1.03） |
+| 官方 1.3B | 0.85 | 1.00（0.97 / 1.02 / 1.02） |
+
+win-study 所有配置的增益都在 0.98–1.05（`win-study/flow_yaw_roi50.txt`）。之前测出的 0.78
+（"flashdreams 少转 20%"）是因为 ROI 从 0.3 W 开始，压到了面板。排查过程中确认过两边的
+Plücker 输入（位姿、内参、射线，只差 bf16 舍入）和 4 步采样器（timestep 999/937/833/624，
+sigma 差 < 6e-4）一致。
+
+**画面变糊**（锐度最后 1/4 / 最前 1/4，x ≥ 0.5 W）：flashdreams baseline 约 0.67，官方约 0.74
+（0.69 / 0.86 / 0.68）。两边都有，不是 flashdreams 独有；这个比值也受相机朝向影响，只能作粗略参考。
 
 ---
 
@@ -227,6 +306,10 @@ sbatch --export=ALL,SWEEP_GROUPS="B0 M1 M2 M3" experiments/kv_offload/sweep.slur
 F40 offload 被 host OOM kill（约 44 GB pinned 内存）。只有 F20 offload 在 V=40 有一个点：
 fetch 9.06 ms/层，compute 19.2 ms/层。还缺能放进显存的窗口（B0–M3）作为 baseline。
 新节点的 host 内存决定最大可用窗口：F40 需要 64 GB 以上。
+
+RTX PRO 6000 Blackwell（2026-11-20，`/mnt/datastore/yiti6755/kv_offload/h2d-1120-2155/h2d.jsonl`）：
+pinned H2D 57.8 GB/s，D2H 57.3 GB/s（PCIe Gen5 x16，1–160 帧都一样；单 NUMA 节点，只测了 unbound）。
+sweep 本身还没在这台机器上跑。
 
 ---
 

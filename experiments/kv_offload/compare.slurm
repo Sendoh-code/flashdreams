@@ -15,6 +15,9 @@
 #   ours         offload-w40 + camera-pose KV bank, 8 retrieved frames per forward
 #   ours-w8      offload, window 8 / sink 6 + 8 retrieved frames: WorldKV's
 #                sink + retrieved + recent layout (recent = current + 1 chunk)
+#   res-w<W>     resident, window W / sink 6 (any W)
+#   ret-w<W>-r<R> offload + camera-pose bank, window W / sink 6, R retrieved frames
+# SEED (default 42) sets the generation seed.
 # Diagnostics: FLASHDREAMS_KV_OFFLOAD_TIMING=1 writes <run>/kv_timing.jsonl (per-layer
 # fetch/stall/compute/writeback); H2D_BENCH=1 appends h2d_bench.py results.
 # Trajectory: WorldKV R_L_R_L_R_L90_360 (in-place yaw sweeps that revisit the same
@@ -61,7 +64,7 @@ run_one() {  # name window sink retrieve offload
     --backpressure-mode block --presentation-mode on_demand \
     --stats-path "$dir/stats.json" \
     -- --example-data --example-idx 0 --pose-path "$POSES" \
-    --total-blocks "$BLOCKS" --warmup-blocks 2 --seed 42 \
+    --total-blocks "$BLOCKS" --warmup-blocks 2 --seed "${SEED:-42}" \
     > "$dir/run.log" 2>&1
   local rc=$? status=ok
   if [[ $rc -ne 0 ]]; then
@@ -80,7 +83,12 @@ declare -A ARGS=(  # name -> window sink retrieve offload
   [ours-w8]="8 6 8 1"
 )
 for name in ${RUNS:-baseline resident-w40 offload-w40 ours}; do
-  run_one "$name" ${ARGS[$name]}
+  if [[ -n ${ARGS[$name]:-} ]]; then args=${ARGS[$name]}
+  elif [[ $name =~ ^res-w([0-9]+)$ ]]; then args="${BASH_REMATCH[1]} 6 0 0"  # resident, sink 6
+  elif [[ $name =~ ^ret-w([0-9]+)-r([0-9]+)$ ]]; then  # offload + camera-pose bank, sink 6
+    args="${BASH_REMATCH[1]} 6 ${BASH_REMATCH[2]} 1"
+  else echo "$name status=unknown-run" | tee -a "$OUT/summary.txt"; continue; fi
+  run_one "$name" $args
 done
 "$PY/python" experiments/kv_offload/compare_metrics.py "$OUT" --poses "$POSES" \
   > "$OUT/metrics.log" 2>&1 || echo "metrics failed (see $OUT/metrics.log)"

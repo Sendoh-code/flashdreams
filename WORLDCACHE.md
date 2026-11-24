@@ -182,6 +182,60 @@ building one is the main refactor toward the goal.
   compute × 5 forwards ≈ the +0.40 s diffuse gap; retrieval host cost is
   negligible.
 
+### RTX PRO 6000 Blackwell rerun (2026-11-20, `4049e1d4`)
+
+All numbers in this section are from a dedicated **RTX PRO 6000 Blackwell
+Server Edition** (96 GB, sm120, PCIe Gen5 x16, one NUMA node), not A100/A40.
+Same bf16 `kv_sweep` app and `compare.slurm` runs as the A100 job, run with
+`bash` (no Slurm). Outputs: `/mnt/datastore/yiti6755/kv_offload/`
+(`h2d-1120-2155/`, `compare-1120-rtx6000/`).
+
+- Pinned H2D 57.8 GB/s, D2H 57.3 GB/s, flat from 1 to 160 frames (2.4× A100).
+- s/chunk (median after 2 warmup chunks): baseline W12 1.16 (13.8 fps),
+  resident-w40 2.04, offload-w40 2.08, ours 2.32 (6.9 fps). GPU peak 26.4 /
+  33.6 / 22.4 / 22.5 GiB; ours host RSS 39.9 GiB. Revisit PSNR 15.5–15.7 for
+  all four on full frames; 14.3–14.5 with the UI panel masked (see below).
+  Noise either way.
+- Steady state per layer: offload-w40 fetch 7.40 / compute 11.85 ms
+  (ratio 0.62), ours 8.69 / 13.66 ms (0.64); stall 2.1% of a forward in both
+  (A100: ratio ≈ 0.96, stall ~7%). H2D runs at 57.6 GB/s. offload-w40 is 1.7%
+  slower than resident-w40 (A100: 4%). **Compute still hides fetch**, with
+  more margin than on A100: bandwidth grew 2.4×, bf16 compute only 1.5×.
+- Caveat: sm120 has FP8; FP8 linears/attention would shrink compute and could
+  bring fetch back to parity. Not measured yet.
+
+### Window study, camera-follow check, UI-panel metric fix (2026-11-24)
+
+- **flashdreams `out.mp4` has the cam2v "Camera controls" UI panel burned in**
+  (top left, x < ~0.45 W, changing text) and is encoded at ~4.5 Mbps
+  (official LingBot: no panel, ~15 Mbps). Every video metric on full frames
+  was contaminated. `compare_metrics.py` now keeps only x >= `--x0` × W
+  (default 0.5; `--x0 0` for full frames). Old full-frame numbers are kept as
+  `metrics_fullframe.*` / `results_fullframe.md` next to the new ones.
+- Window study (`/mnt/datastore/yiti6755/kv_offload/win-study/`, seeds
+  42/43/44, `compare.slurm` `res-w<W>` / `ret-w<W>-r<R>`, panel masked):
+  resident W 12–84 revisit PSNR 13.7–14.2 dB, std 0.5–1.0, no trend. At
+  equal total T = 16/24/32, retrieval `ret-w8-r<T-8>` vs sliding `res-w<T>`,
+  paired by seed: far pairs (>= 200 frames apart) +0.45 / +0.27 / +0.34 dB,
+  better in 7 of 9 pairs; GPU 22 vs 27–31 GiB at +2–3% s/chunk. A weak
+  signal; WorldKV's own code on the 14B model gives ~+0.9 dB at window 18,
+  winning on all 3 seeds (`WorldKV/repro/out/results.md`, gitignored clone).
+  More seeds and clean recordings are needed before calling it a gain.
+- Camera following vs official LingBot-World-V2 1.3B (upstream `1895d30` +
+  SDPA fallback, same image/prompt/poses, sink 6 + window 12, seeds
+  42/43/44; scripts and outputs in `/mnt/datastore/yiti6755/lingbot-upstream/`).
+  Optical-flow yaw over x >= 0.5 W: gain (measured / commanded yaw) flashdreams
+  0.99, official 1.00; per-frame correlation 0.83 vs 0.85. Same for every
+  win-study config (0.98–1.05). An earlier "flashdreams turns 20% less"
+  reading (0.78) came from the panel inside the flow ROI. The CPU checks done
+  while chasing it still hold: Plücker inputs match upstream to bf16 rounding
+  (same 88 latent poses, intrinsics, rays), and the 4-step sampler matches
+  (timesteps 999/937/833/624, sigmas within 6e-4, clean-latent KV refresh).
+- Blur drift (Laplacian sharpness, last / first quarter, x >= 0.5 W): ~0.67
+  for flashdreams baseline, ~0.74 for official (0.69 / 0.86 / 0.68). Both
+  models do it; the ratio also tracks which way the camera faces, so it is
+  only a rough cue. The panel's text had hidden it (0.94 on full frames).
+
 ### Known gaps
 
 - `ci_gpu` `test_kvcache.py` not yet run after the bank-as-only-store change.
@@ -191,8 +245,9 @@ building one is the main refactor toward the goal.
 - Each prefetch re-copies the whole visible prefix on every denoising step
   (marked `ponytail:` in `_prefetch`). Inherent to two device slots: keeping
   history across steps means keeping every layer resident. Hidden at W40 on
-  A100 (fetch ≈ compute); bytes grow linearly with visible length, so longer
-  windows or faster compute will make it the bottleneck.
+  A100 (fetch ≈ compute) and on RTX PRO 6000 bf16 (fetch ≈ 0.62× compute);
+  bytes grow linearly with visible length, so longer windows or faster
+  compute (e.g. FP8) will make it the bottleneck.
 - Not CUDA-graph compatible (slot rebinding + side stream).
 - Covers only `BlockKVCache` in the Wan recipe; not a general policy interface.
 
@@ -205,7 +260,10 @@ building one is the main refactor toward the goal.
 2. Clone WorldKV as above if you need the reference code.
 3. Slurm scripts hard-code Delta paths (`/work/nvme/bicu/ytian6`,
    account `bicu-delta-gpu`); override `SWEEP_ROOT`/`HF_HOME` elsewhere.
-4. Watch the group quota (`quota`): `/work/nvme/bicu` is shared and was full.
+   Current host (since 2026-11-20): a dedicated RTX PRO 6000 without Slurm;
+   run the `.slurm` scripts with `bash` (see `WORLDCACHE_EXPERIMENTS.md` §0).
+4. On Delta, watch the group quota (`quota`): `/work/nvme/bicu` is shared and
+   was full.
 
 ## Next Steps
 
@@ -214,12 +272,16 @@ building one is the main refactor toward the goal.
 2. GPU run of the full-KV offload runner with timing enabled; compare output
    and latency against `lingbot-world-v2-1p3b-causal-fast-perf`
    (`skills/profile-model-performance`, `skills/validate-performance-quality`).
-3. Deferred until H2D stalls dominate (not at W40, see Status): a
+3. Deferred until H2D stalls dominate (not at W40 on A100 or RTX PRO 6000
+   bf16, see Status; recheck with FP8 on RTX PRO 6000): a
    `resident_layers` knob (keep the first M layers' history on device; trades
    memory for H2D). Skipping the write range in prefetch only saves ~9% of
    bytes and no wall time while fetch is hidden.
 4. Bank-as-only-store change: `compare.slurm` done (job 24131186, see
    Status); `ci_gpu` `test_kvcache.py` still pending.
-5. Design a model-agnostic KV policy interface in `core` (storage tier +
+5. Clean recordings for quality metrics: turn off the cam2v UI overlay and
+   raise the mp4 bitrate, then rerun the T = 16/24/32 retrieval vs sliding
+   comparison with more seeds (>= 8) to confirm or reject the far-pair gain.
+6. Design a model-agnostic KV policy interface in `core` (storage tier +
    eviction/retrieval policy) and port window/sink, full, and offload onto it.
-6. Add chunk-level KV identity and a store/lookup path (LMCache-style reuse).
+7. Add chunk-level KV identity and a store/lookup path (LMCache-style reuse).
