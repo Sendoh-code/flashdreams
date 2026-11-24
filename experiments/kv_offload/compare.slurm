@@ -1,5 +1,5 @@
 #!/bin/bash
-# LingBot 1.3B: original KV window vs layerwise offload + camera-pose KV bank, one A100.
+# LingBot 1.3B (or 14B, MODEL=14b): original KV window vs layerwise offload + camera-pose KV bank, one A100.
 #
 #   sbatch experiments/kv_offload/compare.slurm          # all runs (may exceed 1 h cold)
 #
@@ -17,7 +17,8 @@
 #                sink + retrieved + recent layout (recent = current + 1 chunk)
 #   res-w<W>     resident, window W / sink 6 (any W)
 #   ret-w<W>-r<R> offload + camera-pose bank, window W / sink 6, R retrieved frames
-# SEED (default 42) sets the generation seed.
+# SEED (default 42) sets the generation seed. MODEL=14b runs the v2 14B causal-fast
+# preset instead of the 1.3B (MODEL=1p3b); both use len_t 4.
 # Diagnostics: FLASHDREAMS_KV_OFFLOAD_TIMING=1 writes <run>/kv_timing.jsonl (per-layer
 # fetch/stall/compute/writeback); H2D_BENCH=1 appends h2d_bench.py results.
 # Trajectory: WorldKV R_L_R_L_R_L90_360 (in-place yaw sweeps that revisit the same
@@ -50,13 +51,14 @@ export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$TORCHINDUCTOR_CACHE_DIR/triton}
 PY="$REPO/.venv/bin"
 POSES=${POSES:-$REPO/WorldKV/traj/R_L_R_L_R_L90_360/R_L_R_L_R_L90_360_poses.npy}
 BLOCKS=${BLOCKS:-22}  # 360 poses -> 88 latent frames -> 22 chunks of 4
-{ nvidia-smi -L; git rev-parse HEAD; echo "POSES=$POSES BLOCKS=$BLOCKS"; } | tee -a "$OUT/env.txt"
+MODEL=${MODEL:-1p3b}  # kv_sweep validates it
+{ nvidia-smi -L; git rev-parse HEAD; echo "MODEL=$MODEL POSES=$POSES BLOCKS=$BLOCKS"; } | tee -a "$OUT/env.txt"
 
 run_one() {  # name window sink retrieve offload
   local name=$1 dir="$OUT/$1"
   mkdir -p "$dir"
   echo "=== $name ($(date +%T))"
-  KV_SWEEP_WINDOW_T=$2 KV_SWEEP_SINK_T=$3 KV_SWEEP_RETRIEVE_T=$4 KV_SWEEP_OFFLOAD=$5 \
+  KV_SWEEP_MODEL=$MODEL KV_SWEEP_WINDOW_T=$2 KV_SWEEP_SINK_T=$3 KV_SWEEP_RETRIEVE_T=$4 KV_SWEEP_OFFLOAD=$5 \
   KV_SWEEP_ROPE=post KV_SWEEP_BANK_GRANULARITY=chunk KV_SWEEP_BANK_GB=${BANK_GB:-24} \
   FLASHDREAMS_KV_OFFLOAD_TIMING_JSONL=${FLASHDREAMS_KV_OFFLOAD_TIMING:+$dir/kv_timing.jsonl} \
   timeout "${RUN_TIMEOUT:-1500}" /usr/bin/time -v "$PY/flashdreams-run-v2" lingbot.apps.cam2v.kv_sweep \

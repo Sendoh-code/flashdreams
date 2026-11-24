@@ -36,8 +36,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-FRAMES_PER_CHUNK = 16
-"""Pixel frames per steady-state AR chunk (LingBot len_t=4, VAE stride 4)."""
+VAE_STRIDE_T = 4
+"""Pixel frames per latent frame; a steady-state chunk has ``len_t * 4`` pixel frames."""
 
 
 def _gray(frames: torch.Tensor) -> torch.Tensor:
@@ -98,7 +98,12 @@ def _steady(stats: dict, name: str, warmup: int) -> list[float]:
 
 
 def run_metrics(
-    run: Path, pairs: list[tuple[int, int]], warmup: int, far_gap: int, x0: float = 0.0
+    run: Path,
+    pairs: list[tuple[int, int]],
+    warmup: int,
+    far_gap: int,
+    x0: float = 0.0,
+    len_t: int = 4,
 ) -> dict:
     """Speed, memory, and video metrics for one run directory."""
     import imageio.v3 as iio
@@ -108,7 +113,7 @@ def run_metrics(
     total = sorted(_steady(stats, "total_s", warmup))
     out["chunk_s_median"] = statistics.median(total)
     out["chunk_s_p90"] = total[min(len(total) - 1, int(0.9 * len(total)))]
-    out["fps"] = FRAMES_PER_CHUNK / out["chunk_s_median"]
+    out["fps"] = len_t * VAE_STRIDE_T / out["chunk_s_median"]
     out["gpu_peak_gib"] = max(_steady(stats, "mem_peak_gib", 0))
     rss = re.search(
         r"Maximum resident set size \(kbytes\): (\d+)", (run / "run.log").read_text()
@@ -143,7 +148,9 @@ def summarize(out_dir: Path, poses: np.ndarray, args: argparse.Namespace) -> lis
     )
     rows = []
     for run in sorted(p for p in out_dir.iterdir() if (p / "ok").exists()):
-        rows.append(run_metrics(run, pairs, args.warmup, args.far_gap, args.x0))
+        rows.append(
+            run_metrics(run, pairs, args.warmup, args.far_gap, args.x0, args.len_t)
+        )
     base = next((r for r in rows if r["run"] == args.baseline), None)
     for r in rows:
         if base is not None and r is not base:

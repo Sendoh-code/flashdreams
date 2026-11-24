@@ -236,6 +236,32 @@ Same bf16 `kv_sweep` app and `compare.slurm` runs as the A100 job, run with
   models do it; the ratio also tracks which way the camera faces, so it is
   only a rough cue. The panel's text had hidden it (0.94 on full frames).
 
+### LingBot v2 14B: preset fix and offload (2026-11-24)
+
+- `PIPELINE_LINGBOT_WORLD_V2_14B_CAUSAL_FAST` was a copy of v1 Fast:
+  `len_t` 3, timesteps 999/978/947/825, window 63 / sink 0. Upstream v2
+  `generate.py` + README run 14B with chunk 4, timesteps_index
+  [0, 250, 500, 750] (999/967/908/768 at shift 10), local_attn_size 18 /
+  sink 6. The preset now uses `len_t=4`, `denoising_timesteps=[1000, 750,
+  500, 250]`, window 12 / sink 6 (18 frames in all, as in the 1.3B preset).
+- `kv_sweep` takes `KV_SWEEP_MODEL=1p3b|14b` and forces
+  `use_cuda_graph=False` (offload needs it; the 14B preset had graphs on).
+  `compare.slurm` passes `MODEL`.
+- RTX PRO 6000, bf16, `compare-14b-1124/` (seed 42, 22 chunks, timing on):
+  baseline W12 5.96 s/chunk, 69.3 GiB GPU; **resident-w40 OOMs** (95 GiB);
+  offload-w40 9.58 s/chunk, **51.2 GiB**, host RSS 93 GiB; ours (+8
+  retrieved, bank 112 GB) 10.52 s/chunk, 51.6 GiB, host RSS 183 GiB.
+- Steady state per layer (40 layers): offload-w40 fetch 24.6 / compute
+  43.2 ms (ratio 0.57), ours 28.9 / 50.6 ms (0.57); stall 1.4% of a forward;
+  56.8 / 66.7 GB H2D per forward at 57.7 GB/s. **Compute still hides fetch
+  on 14B**, same margin as 1.3B: fetch grows with the window, but so does
+  attention. Offload lets 14B run a window that does not fit resident, with
+  less GPU memory than the W12 baseline.
+- Quality (one seed, panel masked): revisit PSNR 9.25 / 9.60 / 9.06 dB
+  (baseline / offload-w40 / ours). Noise; 14B frames have a large moving
+  horse and rider in the foreground, so these are not comparable to 1.3B
+  numbers. Camera following is fine (flow yaw gain 1.04, corr 0.87).
+
 ### Known gaps
 
 - `ci_gpu` `test_kvcache.py` not yet run after the bank-as-only-store change.
@@ -273,7 +299,7 @@ Same bf16 `kv_sweep` app and `compare.slurm` runs as the A100 job, run with
    and latency against `lingbot-world-v2-1p3b-causal-fast-perf`
    (`skills/profile-model-performance`, `skills/validate-performance-quality`).
 3. Deferred until H2D stalls dominate (not at W40 on A100 or RTX PRO 6000
-   bf16, see Status; recheck with FP8 on RTX PRO 6000): a
+   bf16, 1.3B or 14B, see Status; recheck with FP8 on RTX PRO 6000): a
    `resident_layers` knob (keep the first M layers' history on device; trades
    memory for H2D). Skipping the write range in prefetch only saves ~9% of
    bytes and no wall time while fetch is hidden.

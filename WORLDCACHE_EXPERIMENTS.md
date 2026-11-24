@@ -238,6 +238,45 @@ sigma 差 < 6e-4）一致。
 **画面变糊**（锐度最后 1/4 / 最前 1/4，x ≥ 0.5 W）：flashdreams baseline 约 0.67，官方约 0.74
 （0.69 / 0.86 / 0.68）。两边都有，不是 flashdreams 独有；这个比值也受相机朝向影响，只能作粗略参考。
 
+### 2.2 LingBot v2 14B（RTX PRO 6000，2026-11-24）
+
+**准备**：checkpoint `robbyant/lingbot-world-v2-14b-causal-fast` 的 `transformers/*` 约 74 GB（fp32 分片，
+加载成 bf16）。T5 / VAE 和 1.3B 共用。下载时同样会碰到 Xet 卡死（分片已完整，进程不退出），按 §0
+的方法处理：杀进程，校验 sha256，去掉 `.incomplete` 后缀，再跑一次 `snapshot_download`。
+
+**preset 修正**：`lingbot-world-v2-14b-causal-fast` 原来照搬了 v1 Fast（`len_t` 3、timestep
+999/978/947/825、window 63 / sink 0），现在按官方 v2 改为 `len_t` 4、timestep 999/967/908/768
+（shift 10）、window 12 / sink 6（官方 `local_attn_size 18`、`sink_size 6`，18 帧里包含 sink 和当前 chunk）。
+
+**运行**：
+
+```bash
+MODEL=14b BANK_GB=112 FLASHDREAMS_KV_OFFLOAD_TIMING=1 RUN_TIMEOUT=3600 \
+  RUNS="baseline resident-w40 offload-w40 ours" OUT=$SWEEP_ROOT/compare-14b-$(date +%m%d) \
+  bash experiments/kv_offload/compare.slurm
+```
+
+每个 run 要重新加载约 74 GB 权重（约 4 分钟），第一次还要编译。`BANK_GB=112` 足够放下 88 个
+latent 帧 × 每帧约 1.24 GB 的全部历史；`ours` 的 host RSS 约 183 GiB，需要 200 GB 以上内存。
+
+**结果**（seed 42，22 个 chunk，`compare-14b-1124/`）：
+
+| run | chunk s（中位） | GPU GiB | host RSS GiB | revisit PSNR / SSIM（遮罩） |
+| --- | --- | --- | --- | --- |
+| baseline（W12） | 5.96 | 69.3 | 70.2 | 9.25 / 0.266 |
+| resident-w40 | OOM（95 GiB 用满） | | | |
+| offload-w40 | 9.58 | 51.2 | 92.9 | 9.60 / 0.272 |
+| ours（+8 检索帧） | 10.52 | 51.6 | 182.9 | 9.06 / 0.233 |
+
+稳态逐层计时（最后 40 次 forward，40 层）：offload-w40 fetch 24.6 / compute 43.2 ms（比值 0.57），
+ours 28.9 / 50.6 ms（0.57）；stall 约占每次 forward 的 1.4%；每次 forward 拷贝 56.8 / 66.7 GB，
+H2D 57.7 GB/s。**14B 上 compute 仍然掩盖 fetch**，余量和 1.3B 相当。offload 让 W40 在 14B 上能跑，
+显存比 W12 baseline 还少 18 GiB；offload-w40 比 baseline 慢 61%，主要是 W40 本身的 attention 计算，
+不是 H2D。ours 比 offload-w40 慢 10%，来自多出的 8 个检索帧（attention 54 vs 46 帧）。
+
+质量：14B 画面前景有一匹会动的大马和骑手，revisit PSNR 只有约 9 dB，不能和 1.3B 的数字比；
+单 seed 下三者差异属于噪声。相机跟随正常（光流 yaw 增益 1.04，相关系数 0.87）。
+
 ---
 
 ## 3. KV bank 与 pre/post-RoPE 端到端（`bank_test.slurm`）
