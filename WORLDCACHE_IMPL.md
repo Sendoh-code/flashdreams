@@ -263,6 +263,31 @@ H2D 字节数不变（每层每条目一次拷贝，frame 粒度下拷贝调用�
 
 ---
 
+## 8. 常驻 bank（WorldKV 布局，2026-11-25）
+
+**问题**：WorldKV 把 cache 全部留在显存，只有检索用的 bank 在 host。要在同一套代码里复现它的设置，
+并和逐层 offload 对比。
+
+| 文件 | 行号 | 内容 |
+| --- | --- | --- |
+| `core/attention/kvcache.py` | 932–940 | `LayerwiseKVOffload(bank, resident=False)`；`resident=True` 必须有 bank；`_filled` / `_dirty` / `_chunk` 记录每个 cache 本 chunk 是否已填 retrieve 区 |
+| `core/attention/kvcache.py` | 962–964, 993–994 | `add`：常驻模式不拿 slot、不换成 meta，只建 host sink buffer 和 side stream |
+| `core/attention/kvcache.py` | 1010–1027 | `begin_chunk` 换 chunk 时清 `_filled`；`reset` 清 `_dirty` |
+| `core/attention/kvcache.py` | 1030–1036 | `before_layer`：常驻模式每个 chunk 第一次 forward 时在 compute stream 上把检索条目拷进 retrieve 区，之后直接返回 |
+| `core/attention/kvcache.py` | 1058, 1074 | `after_layer`：常驻模式不计时、不解绑；写回 bank 照常 |
+| `core/attention/kvcache.py` | 1118–1140 | `_retrieve_copies`：检索条目 + sink buffer 补齐 retrieve 区剩余部分；常驻模式只在本次有检索、或上次有检索需要恢复 sink 时拷贝（`_dirty`）。offload 的 `_prefetch` 也走这里 |
+| `core/attention/kvbank.py` | 104–122 | `CameraPoseRetrieval.min_gap_t`：跳过结束位置距 query 不足这么多帧的候选 |
+| `recipes/wan/transformer/wan21.py` | 204–210, 298, 513–522 | `kv_bank` 不再要求 `kv_offload`；两者任一都禁 CUDA graph；`resident=not cfg.kv_offload` |
+| `integrations_v2/lingbot/apps/cam2v/kv_sweep.py` | 35, 49, 60 | `KV_SWEEP_MODEL=v1fast`；检索不再隐含 offload；`KV_SWEEP_RETRIEVE_GAP_T` |
+| `experiments/kv_offload/compare.slurm` | 22–27, 77, 94–95, 105 | `wkv-*` run、可选第 6 个参数 retrieve gap、`APP_ARGS`、`METRIC_ARGS` |
+| `experiments/kv_offload/latent_parity.py` | 全文件 | dump `WanVAE.decode` 的输入 latent，`--compare` 逐位比较 |
+
+**测试**：`test_kvcache.py` 252（每 4 个 chunk 有一次空检索，覆盖 sink 恢复）、262/275（bank 测试按
+`resident` 参数化）、377（`min_gap_t`）。`ci_cpu` 23 / `ci_gpu` 15 passed。端到端：eager 1.3B 下 resident
+与 offload 的 latent 逐位相同（`WORLDCACHE_EXPERIMENTS.md` §2.3）。
+
+---
+
 ## 7. 待实现组件（实现后在此追加小节，写清文件与行号）
 
 对应 `WORLDCACHE.md` → Next Steps：

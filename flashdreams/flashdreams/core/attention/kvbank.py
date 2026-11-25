@@ -101,6 +101,13 @@ class CameraPoseRetrieval(KVRetrievalPolicy):
     translation_weight: float = 0.5
     """Weight of the translation term; rotation gets ``1 - translation_weight``."""
 
+    min_gap_t: int = 0
+    """Skip candidates ending fewer than this many frames before the query chunk.
+
+    WorldKV excludes its 6 "recent" frames from retrieval although it attends
+    only 3 of them besides the current chunk, so the chunk just outside the
+    window is never retrieved; set this to the window size to match."""
+
     def select(
         self,
         bank: KVBank,
@@ -108,6 +115,12 @@ class CameraPoseRetrieval(KVRetrievalPolicy):
         candidates: list[KVBankEntry],
         k: int,
     ) -> list[KVBankEntry]:
+        candidates = [
+            c for c in candidates if c.frame + c.num_frames + self.min_gap_t <= query.frame
+        ]
+        if not candidates:
+            return []
+
         def mean_pose(entry: KVBankEntry) -> tuple[Tensor, Tensor]:
             pose = entry.meta[self.key].reshape(-1, 4, 4).float().cpu()
             return pose[:, :3, 3].mean(0), pose[:, :3, :3].mean(0)

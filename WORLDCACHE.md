@@ -262,12 +262,50 @@ Same bf16 `kv_sweep` app and `compare.slurm` runs as the A100 job, run with
   horse and rider in the foreground, so these are not comparable to 1.3B
   numbers. Camera following is fine (flow yaw gain 1.04, corr 0.87).
 
+### WorldKV setting, resident bank, and run-to-run determinism (2026-11-25)
+
+- New: `kv_bank` without `kv_offload` keeps caches on the device
+  (`LayerwiseKVOffload(resident=True)`, WorldKV's layout): only bank entries
+  cross PCIe, the retrieve region is filled once per chunk.
+  `CameraPoseRetrieval.min_gap_t` skips candidates ending within that many
+  frames of the query (WorldKV excludes its 6 "recent" frames). `kv_sweep`
+  has `KV_SWEEP_MODEL=v1fast` (v1 LingBot-World-Fast 14B, `len_t` 3) and
+  `KV_SWEEP_RETRIEVE_GAP_T`; `compare.slurm` has `wkv-baseline` (W12/S6),
+  `wkv-resident` (S3 + 9 retrieved + W6, gap 6), `wkv-ours` (same + offload).
+- RTX PRO 6000, v1fast, 30 chunks, seeds 42/43/44, panel masked
+  (`/mnt/datastore/yiti6755/kv_offload/wkv-1125{,-bank120}/`): s/chunk 4.39–4.42
+  / 4.48–4.52 / 4.43–4.45, GPU 66.8 / 66.8 / **47.5 GiB** (baseline /
+  resident / ours). Mean revisit PSNR, bank 24 GB: 9.81 / 9.57 / 8.70 dB;
+  bank 120 GB (all 30 chunks retrievable): resident 9.00, ours 7.86. Host RSS
+  ~180 GB with the 120 GB bank; its pinned allocation stretches a run from
+  ~4 to 8 (resident) / 24 (ours) min, per-chunk speed unchanged. No retrieval
+  gain over baseline, unlike WorldKV's own +0.9 dB.
+- ours < resident in 6/6 seed×bank pairs (mean −1.0 dB) looked like an
+  offload bug. **It is not: offload and resident are bit-identical.** Eager
+  1.3B, WorldKV layout scaled to `len_t` 4 (S4 + R8 + W8, gap 8, chunk bank),
+  8 chunks: decoded latents of resident vs offload are bit-equal for every
+  chunk, with and without the bank; bank vs no bank diverge exactly at chunk 5
+  when retrieval starts, and the offload arm streamed 5.56 GB H2D per forward.
+  `test_kvcache.py` `ci_gpu` 15 passed (first run since bank-as-only-store).
+- **Compiled runs are not reproducible.** Same config, same seed, twice
+  (frame PSNR of the two videos): compiled 33 dB at frame 1 → 25 dB by chunk
+  3, drifting (Inductor `max-autotune` kernel choice, amplified by the
+  rollout); `--no-compile` ~38 dB flat with **bit-equal latents** (the rest is
+  VAE decode / mp4 encode, which never feeds back). Deterministic algorithms
+  and an eager VAE decoder change nothing. Every earlier quality comparison
+  (window study's +0.3–0.45 dB, 14B, wkv-1125) is one compiled recording per
+  seed, so differences below ~1 dB there are noise, not evidence.
+- Tool: `experiments/kv_offload/latent_parity.py` dumps decoded latents and
+  compares two dumps; `compare.slurm` passes `APP_ARGS` (e.g. `--no-compile`).
+
 ### Known gaps
 
-- `ci_gpu` `test_kvcache.py` not yet run after the bank-as-only-store change.
-  End-to-end bank runs (`bank-1113-1640`, all five ok; A40 bank ≈ +26%
+- End-to-end bank runs (`bank-1113-1640`, all five ok; A40 bank ≈ +26%
   s/chunk vs resident, −3.8 GiB GPU) are in `WORLDCACHE_EXPERIMENTS.md` §3.
-- No quality parity vs resident KV, no perf numbers beyond the one sweep point.
+- Offload vs resident parity is shown bit-exact only on eager 1.3B, 8 chunks,
+  no bank eviction; not on v1fast 14B / 30 chunks.
+- No quality gain from retrieval shown yet: all quality runs so far are
+  compiled, single-recording, and within noise.
 - Each prefetch re-copies the whole visible prefix on every denoising step
   (marked `ponytail:` in `_prefetch`). Inherent to two device slots: keeping
   history across steps means keeping every layer resident. Hidden at W40 on
@@ -293,8 +331,8 @@ Same bf16 `kv_sweep` app and `compare.slurm` runs as the A100 job, run with
 
 ## Next Steps
 
-1. Validate: `uv run pytest -m ci_cpu flashdreams/tests/test_kvcache.py -k layerwise`,
-   then the `ci_gpu` timing test on a GPU host.
+1. Validate: done (`test_kvcache.py` `ci_cpu` 23 / `ci_gpu` 15 passed,
+   2026-11-25); rerun both after every KV change.
 2. GPU run of the full-KV offload runner with timing enabled; compare output
    and latency against `lingbot-world-v2-1p3b-causal-fast-perf`
    (`skills/profile-model-performance`, `skills/validate-performance-quality`).
@@ -303,11 +341,13 @@ Same bf16 `kv_sweep` app and `compare.slurm` runs as the A100 job, run with
    `resident_layers` knob (keep the first M layers' history on device; trades
    memory for H2D). Skipping the write range in prefetch only saves ~9% of
    bytes and no wall time while fetch is hidden.
-4. Bank-as-only-store change: `compare.slurm` done (job 24131186, see
-   Status); `ci_gpu` `test_kvcache.py` still pending.
-5. Clean recordings for quality metrics: turn off the cam2v UI overlay and
-   raise the mp4 bitrate, then rerun the T = 16/24/32 retrieval vs sliding
-   comparison with more seeds (>= 8) to confirm or reject the far-pair gain.
+4. Bank-as-only-store change: done (`compare.slurm` job 24131186; `ci_gpu`
+   `test_kvcache.py` 15 passed 2026-11-25).
+5. Quality comparisons: run eager (`APP_ARGS=--no-compile`, deterministic, so
+   arms pair exactly per seed) or use >= 8 seeds compiled. First rerun the
+   WorldKV setting (`wkv-*`, v1fast) eager to answer whether retrieval helps
+   at all; then the T = 16/24/32 retrieval vs sliding comparison. Also turn
+   off the cam2v UI overlay and raise the mp4 bitrate.
 6. Design a model-agnostic KV policy interface in `core` (storage tier +
    eviction/retrieval policy) and port window/sink, full, and offload onto it.
 7. Add chunk-level KV identity and a store/lookup path (LMCache-style reuse).

@@ -17,7 +17,15 @@
 #                sink + retrieved + recent layout (recent = current + 1 chunk)
 #   res-w<W>     resident, window W / sink 6 (any W)
 #   ret-w<W>-r<R> offload + camera-pose bank, window W / sink 6, R retrieved frames
-# SEED (default 42) sets the generation seed. MODEL=14b runs the v2 14B causal-fast
+# WorldKV setting (MODEL=v1fast BLOCKS=30: v1 LingBot-World-Fast 14B, len_t 3, 18
+# attended frames; mirrors WorldKV generate_fast.py, wr9 = 3 retrieved chunks, no compression):
+#   wkv-baseline resident window 12 / sink 6 (the v2 README policy, also 18 frames)
+#   wkv-resident resident sink 3 + 9 retrieved + window 6, bank on host, retrieval
+#                skips the 6 frames before the chunk (WorldKV --use_retrieval --retrieval_frames 9)
+#   wkv-ours     wkv-resident with layerwise offload
+# with METRIC_ARGS="--len-t 3 --min-src 12 --min-gap 80 --baseline wkv-baseline" (WorldKV eval.py pairs).
+# APP_ARGS is appended to the app args (e.g. --no-compile: compiled runs are not
+# reproducible, eager ones are bit-identical). SEED (default 42) sets the generation seed. MODEL=14b runs the v2 14B causal-fast
 # preset instead of the 1.3B (MODEL=1p3b); both use len_t 4.
 # Diagnostics: FLASHDREAMS_KV_OFFLOAD_TIMING=1 writes <run>/kv_timing.jsonl (per-layer
 # fetch/stall/compute/writeback); H2D_BENCH=1 appends h2d_bench.py results.
@@ -54,11 +62,11 @@ BLOCKS=${BLOCKS:-22}  # 360 poses -> 88 latent frames -> 22 chunks of 4
 MODEL=${MODEL:-1p3b}  # kv_sweep validates it
 { nvidia-smi -L; git rev-parse HEAD; echo "MODEL=$MODEL POSES=$POSES BLOCKS=$BLOCKS"; } | tee -a "$OUT/env.txt"
 
-run_one() {  # name window sink retrieve offload
+run_one() {  # name window sink retrieve offload [retrieve-gap]
   local name=$1 dir="$OUT/$1"
   mkdir -p "$dir"
   echo "=== $name ($(date +%T))"
-  KV_SWEEP_MODEL=$MODEL KV_SWEEP_WINDOW_T=$2 KV_SWEEP_SINK_T=$3 KV_SWEEP_RETRIEVE_T=$4 KV_SWEEP_OFFLOAD=$5 \
+  KV_SWEEP_MODEL=$MODEL KV_SWEEP_WINDOW_T=$2 KV_SWEEP_SINK_T=$3 KV_SWEEP_RETRIEVE_T=$4 KV_SWEEP_OFFLOAD=$5 KV_SWEEP_RETRIEVE_GAP_T=${6:-0} \
   KV_SWEEP_ROPE=post KV_SWEEP_BANK_GRANULARITY=chunk KV_SWEEP_BANK_GB=${BANK_GB:-24} \
   FLASHDREAMS_KV_OFFLOAD_TIMING_JSONL=${FLASHDREAMS_KV_OFFLOAD_TIMING:+$dir/kv_timing.jsonl} \
   timeout "${RUN_TIMEOUT:-1500}" /usr/bin/time -v "$PY/flashdreams-run-v2" lingbot.apps.cam2v.kv_sweep \
@@ -66,7 +74,7 @@ run_one() {  # name window sink retrieve offload
     --backpressure-mode block --presentation-mode on_demand \
     --stats-path "$dir/stats.json" \
     -- --example-data --example-idx 0 --pose-path "$POSES" \
-    --total-blocks "$BLOCKS" --warmup-blocks 2 --seed "${SEED:-42}" \
+    --total-blocks "$BLOCKS" --warmup-blocks 2 --seed "${SEED:-42}" ${APP_ARGS:-} \
     > "$dir/run.log" 2>&1
   local rc=$? status=ok
   if [[ $rc -ne 0 ]]; then
@@ -79,10 +87,12 @@ run_one() {  # name window sink retrieve offload
   echo "$name status=$status" | tee -a "$OUT/summary.txt"
 }
 
-declare -A ARGS=(  # name -> window sink retrieve offload
+declare -A ARGS=(  # name -> window sink retrieve offload [retrieve-gap]
   [baseline]="12 6 0 0" [resident-w40]="40 6 0 0"
   [offload-w40]="40 6 0 1" [ours]="40 6 8 1"
   [ours-w8]="8 6 8 1"
+  [wkv-baseline]="12 6 0 0"
+  [wkv-resident]="6 3 9 0 6" [wkv-ours]="6 3 9 1 6"
 )
 for name in ${RUNS:-baseline resident-w40 offload-w40 ours}; do
   if [[ -n ${ARGS[$name]:-} ]]; then args=${ARGS[$name]}
@@ -92,7 +102,7 @@ for name in ${RUNS:-baseline resident-w40 offload-w40 ours}; do
   else echo "$name status=unknown-run" | tee -a "$OUT/summary.txt"; continue; fi
   run_one "$name" $args
 done
-"$PY/python" experiments/kv_offload/compare_metrics.py "$OUT" --poses "$POSES" \
+"$PY/python" experiments/kv_offload/compare_metrics.py "$OUT" --poses "$POSES" ${METRIC_ARGS:-} \
   > "$OUT/metrics.log" 2>&1 || echo "metrics failed (see $OUT/metrics.log)"
 if [[ -n ${H2D_BENCH:-} ]]; then  # raw pinned-copy GB/s, NUMA-bound and unbound
   BUS=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader | head -1 | tr 'A-F' 'a-f' | sed 's/^0000//')
