@@ -1,7 +1,7 @@
 # WorldCache 实现索引（代码位置 + 行号）
 
 `WORLDCACHE.md` 记录目标/状态/下一步；本文件记录**每个已实现组件改在了哪里**，
-精确到文件与行号。行号基于分支 `kv-offload-sweep` 的 `99b072de`（「bank 作为唯一 host 存储」改动见 §6，`8c4a9932`）。
+精确到文件与行号。行号基于分支 `kv-offload-sweep` 的 `99b072de`（「bank 作为唯一 host 存储」改动见 §6，`8c4a9932`）；`kv_sweep.py` 与 `config.py` 的行号基于分支 `win-study-metrics`（14B 支持）。
 **每新增或修改一个组件，都要在本文件追加/更新对应小节和行号**（见文末「维护规则」）。
 
 ---
@@ -89,7 +89,8 @@ compute     :          wait r0 [layer 0]    wait r1 [layer 1]    wait r2 ...
 | --- | --- |
 | `integrations_v2/lingbot/impl/transformer/impl/network.py:151–178` | 覆写 `initialize_cache`：offload 时关闭 `reuse_key_history`（174–177），因为 Sage key-sum 会在 `before_update` 里从（已在 host 的）K buffer 读取 |
 | `integrations_v2/lingbot/impl/transformer/impl/modules.py:264, 280, 376–382, 437` | `reuse_key_history` 的定义与使用（被上面关闭；pre-RoPE 时也关闭，见 §4） |
-| `integrations_v2/lingbot/config.py:204–217` | preset `lingbot-world-v2-1p3b-causal-fast-perf-fullkv-offload`：`window_size_t=80, sink_size_t=0, kv_offload=True`；注册进 `PIPELINE_CONFIGS`（219–） |
+| `integrations_v2/lingbot/config.py:214–226` | preset `lingbot-world-v2-1p3b-causal-fast-perf-fullkv-offload`：`window_size_t=80, sink_size_t=0, kv_offload=True`；注册进 `PIPELINE_CONFIGS`（229–） |
+| `integrations_v2/lingbot/config.py:121–137` | preset `lingbot-world-v2-14b-causal-fast`：按官方 v2 设 `len_t=4`、`denoising_timesteps=[1000, 750, 500, 250]`、window 12 / sink 6（原来照搬 v1 Fast） |
 | `integrations_v2/lingbot/apps/cam2v/adapter.py:128–132, 141` | `create_app_v2_1p3b_causal_fast_perf_fullkv_offload` |
 | `integrations_v2/lingbot/pyproject.toml:37` | 对应 app entry point |
 
@@ -115,7 +116,8 @@ compute     :          wait r0 [layer 0]    wait r1 [layer 1]    wait r2 ...
 
 | 文件:行号 | 内容 |
 | --- | --- |
-| `integrations_v2/lingbot/apps/cam2v/kv_sweep.py:25–` | `create_app()`：从 `KV_SWEEP_WINDOW_T / KV_SWEEP_SINK_T / KV_SWEEP_OFFLOAD` 读 KV 策略，bank 与 RoPE 开关见 §3.4 / §4；sm86 用 `linear_backend="torch"`、`self_attention_backend="wan"`（49–53） |
+| `integrations_v2/lingbot/apps/cam2v/kv_sweep.py:29–41` | `KV_SWEEP_MODEL=1p3b\|14b` 选基础 preset（`_BASE_CONFIGS`） |
+| `integrations_v2/lingbot/apps/cam2v/kv_sweep.py:35–` | `create_app()`：从 `KV_SWEEP_WINDOW_T / KV_SWEEP_SINK_T / KV_SWEEP_OFFLOAD` 读 KV 策略，bank 与 RoPE 开关见 §3.4 / §4；bf16 `linear_backend="torch"`、`self_attention_backend="wan"`（65–69）；`use_cuda_graph=False`（76，offload 需要） |
 | `experiments/kv_offload/h2d_bench.py:17–47` | `FRAME_MB`（每帧每层 K+V MB）、`bench()`（21）测 pinned H2D/D2H GB/s、`main()`（36） |
 | `experiments/kv_offload/sweep.slurm:1–114` | 窗口 × 常驻/offload 矩阵，NUMA 绑定，串行执行（用法见 1–22 行注释） |
 | `experiments/kv_offload/analyze.py` | `forward_rows`（26，丢弃 warmup）、`crossover`（52，线性拟合 fetch/compute 求 V*，及 stall>5% 的经验 V*）、`step_wall_s`（77）、`dmon_rx_gbps`（89）、`analyze`（107）、`plot`（158）、`self_check`（181） |
@@ -177,7 +179,7 @@ retrieve 区就是 `BlockKVCache` sink 的尾部，所以窗口滚动不会动�
 | `integrations_v2/lingbot/impl/encoder/camctrl.py:76–78, 184` | `I2VCamCtrlEmbeddings.poses`：每个 latent 帧的绝对 c2w 位姿 `[..., T, 4, 4]` |
 | `integrations_v2/lingbot/impl/transformer/__init__.py:219–224` | `predict_flow` 每 chunk 一次 `bank.annotate(per_frame={"poses": ...})`（`start()` → `begin_chunk` 先于它） |
 | `integrations_v2/lingbot/impl/transformer/__init__.py:248` | patchify 时保留 `poses` |
-| `integrations_v2/lingbot/apps/cam2v/kv_sweep.py:29–40` | `KV_SWEEP_RETRIEVE_T>0` 时启用 `CameraPoseRetrieval` bank（隐含 offload）；`KV_SWEEP_BANK_GB`（默认 8）、`KV_SWEEP_BANK_GRANULARITY` |
+| `integrations_v2/lingbot/apps/cam2v/kv_sweep.py:44–56` | `KV_SWEEP_RETRIEVE_T>0` 时启用 `CameraPoseRetrieval` bank（隐含 offload）；`KV_SWEEP_BANK_GB`（默认 8）、`KV_SWEEP_BANK_GRANULARITY` |
 
 ### 3.5 测试
 
@@ -214,7 +216,7 @@ bank 原样存 cache 里的 K，所以不另设 bank 级开关，以免两个开
 | `lingbot/.../modules.py:310, 318, 328` | `CamCtrlBlock(apply_rope_before_kvcache=...)` 透传给 `Block` 与 `OptimizedSelfAttention` |
 | `lingbot/.../modules.py:376–382` | pre-RoPE 时关闭 Sage `reuse_key_history`（存的是未旋转 K 的和） |
 | `integrations_v2/lingbot/impl/transformer/impl/network.py:190` | `_build_block` 传入 `self.apply_rope_before_kvcache`（此前 LingBot 一直强制 post） |
-| `integrations_v2/lingbot/apps/cam2v/kv_sweep.py:31–33, 45, 49–53` | `KV_SWEEP_ROPE=pre\|post`（默认 post），名字后缀 `-prerope` |
+| `integrations_v2/lingbot/apps/cam2v/kv_sweep.py:46–48, 60, 65–69` | `KV_SWEEP_ROPE=pre\|post`（默认 post），名字后缀 `-prerope` |
 
 测试：`integrations_v2/lingbot/tests/test_rope_kvcache.py:30–` `test_pre_and_post_rope_cache_match_without_roll`
 （`ci_gpu`）：sink 0、不滚窗时槽位位置 = 全局位置，两种模式的 `CamCtrlBlock` 输出应一致，

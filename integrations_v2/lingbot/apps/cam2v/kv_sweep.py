@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""A40 (sm86) LingBot 1.3B app for KV window / host-offload sweeps.
+"""bf16 LingBot app for KV window / host-offload sweeps (1.3B or 14B).
 
 Run as ``flashdreams-run-v2 lingbot.apps.cam2v.kv_sweep``; the KV policy comes
 from ``KV_SWEEP_WINDOW_T``, ``KV_SWEEP_SINK_T``, and ``KV_SWEEP_OFFLOAD=1``.
@@ -9,6 +9,8 @@ from ``KV_SWEEP_WINDOW_T``, ``KV_SWEEP_SINK_T``, and ``KV_SWEEP_OFFLOAD=1``.
 ``KV_SWEEP_BANK_GB`` (default 8) and ``KV_SWEEP_BANK_GRANULARITY``
 (``chunk``/``frame``). ``KV_SWEEP_ROPE=pre`` caches K before RoPE
 (cache-relative positions) instead of the default ``post``.
+``KV_SWEEP_MODEL`` picks the base preset: ``1p3b`` (default) or ``14b`` (v2 14B
+causal-fast).
 """
 
 from __future__ import annotations
@@ -19,11 +21,24 @@ from flashdreams.api_v2.application import IApplication
 from flashdreams.core.attention import CameraPoseRetrieval, KVBankConfig
 from flashdreams.infra.config import derive_config
 from lingbot.apps.cam2v.adapter import LingbotCam2VApplication
-from lingbot.config import PIPELINE_LINGBOT_WORLD_V2_1P3B_CAUSAL_FAST_PERF
+from lingbot.config import (
+    PIPELINE_LINGBOT_WORLD_V2_1P3B_CAUSAL_FAST_PERF,
+    PIPELINE_LINGBOT_WORLD_V2_14B_CAUSAL_FAST,
+)
+
+_BASE_CONFIGS = {
+    "1p3b": PIPELINE_LINGBOT_WORLD_V2_1P3B_CAUSAL_FAST_PERF,
+    "14b": PIPELINE_LINGBOT_WORLD_V2_14B_CAUSAL_FAST,
+}
 
 
 def create_app() -> IApplication:
-    """Return the bf16 1.3B app with the KV policy read from the environment."""
+    """Return the bf16 app with the model and KV policy read from the environment."""
+    model = os.environ.get("KV_SWEEP_MODEL", "1p3b")
+    if model not in _BASE_CONFIGS:
+        raise ValueError(
+            f"KV_SWEEP_MODEL must be one of {sorted(_BASE_CONFIGS)}, got {model!r}"
+        )
     window_t = int(os.environ.get("KV_SWEEP_WINDOW_T", "12"))
     sink_t = int(os.environ.get("KV_SWEEP_SINK_T", "6"))
     retrieve_t = int(os.environ.get("KV_SWEEP_RETRIEVE_T", "0"))
@@ -40,12 +55,13 @@ def create_app() -> IApplication:
             policy=CameraPoseRetrieval(),
         )
     config = derive_config(
-        PIPELINE_LINGBOT_WORLD_V2_1P3B_CAUSAL_FAST_PERF,
-        name=f"lingbot-1p3b-a40-w{window_t}-s{sink_t}{'-offload' if offload else ''}"
+        _BASE_CONFIGS[model],
+        name=f"lingbot-{model}-w{window_t}-s{sink_t}{'-offload' if offload else ''}"
         f"{f'-r{retrieve_t}' if retrieve_t else ''}{'-prerope' if rope == 'pre' else ''}",
         diffusion_model=dict(
             transformer=dict(
-                # sm86 has no FP8: use bf16 linears and Wan attention.
+                # bf16 linears and Wan attention: runs on sm86 (no FP8) and
+                # keeps numbers comparable across GPUs.
                 network=dict(
                     linear_backend="torch",
                     self_attention_backend="wan",
@@ -55,6 +71,9 @@ def create_app() -> IApplication:
                 sink_size_t=sink_t,
                 kv_offload=offload,
                 kv_bank=bank,
+                # Offload rebinds slots per layer; keep every arm graph-free
+                # (the 1.3B preset already is, the 14B one is not).
+                use_cuda_graph=False,
             ),
         ),
     )

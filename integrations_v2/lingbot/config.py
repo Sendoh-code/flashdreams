@@ -122,7 +122,17 @@ PIPELINE_LINGBOT_WORLD_V2_14B_CAUSAL_FAST = derive_config(
     PIPELINE_LINGBOT_WORLD_FAST,
     name="lingbot-world-v2-14b-causal-fast",
     diffusion_model=dict(
-        transformer=dict(checkpoint_path=LINGBOT_WORLD_V2_CHECKPOINT_PATH),
+        # Upstream v2 generate.py: chunk_size 4 and timesteps_index
+        # [0, 250, 500, 750] for every causal-fast model (v1 Fast used 3 and
+        # [0, 179, 358, 679]); README runs 14B with local_attn_size 18 /
+        # sink_size 6, i.e. 18 frames in all, sink and current chunk included.
+        transformer=dict(
+            checkpoint_path=LINGBOT_WORLD_V2_CHECKPOINT_PATH,
+            len_t=4,
+            window_size_t=12,
+            sink_size_t=6,
+        ),
+        scheduler=dict(denoising_timesteps=[1000, 750, 500, 250]),
     ),
 )
 PIPELINE_LINGBOT_WORLD_V2_14B_CAUSAL_FAST_TAEHV_WINDOW15_SINK3 = derive_config(

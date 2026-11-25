@@ -12,9 +12,13 @@ Per run (``<out_dir>/<run>/`` with ``out.mp4``, ``stats.json``, ``run.log``):
 - memory: peak GPU memory (``mem_peak_gib``) and host max RSS (``/usr/bin/time -v``);
 - revisit consistency: PSNR / SSIM between frame ``j`` and the first earlier frame
   ``i`` with the same camera pose (rotation < ``--max-deg``) at least ``--min-gap``
-  frames back, skipping sources inside the sink;
+  frames back, skipping sources inside the sink; also split into near / far
+  pairs at ``--far-gap`` frames apart;
 - no-reference quality proxies: Laplacian sharpness and its last/first quarter
   ratio (blur drift), plus PSNR vs the baseline run (divergence, not quality).
+
+All video metrics use only columns ``x >= --x0 * width``: flashdreams cam2v mp4s have
+the "Camera controls" UI panel burned in at the top left (``x < ~0.45 W``).
 
 Writes ``metrics.json`` and ``metrics.md`` into ``<out_dir>``.
 """
@@ -32,8 +36,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-FRAMES_PER_CHUNK = 16
-"""Pixel frames per steady-state AR chunk (LingBot len_t=4, VAE stride 4)."""
+VAE_STRIDE_T = 4
+"""Pixel frames per latent frame; a steady-state chunk has ``len_t * 4`` pixel frames."""
 
 
 def _gray(frames: torch.Tensor) -> torch.Tensor:
@@ -58,7 +62,9 @@ def ssim(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     syy = F.conv2d(y * y, w) - mu_y**2
     sxy = F.conv2d(x * y, w) - mu_x * mu_y
     c1, c2 = 0.01**2, 0.03**2
-    s = ((2 * mu_x * mu_y + c1) * (2 * sxy + c2)) / ((mu_x**2 + mu_y**2 + c1) * (sxx + syy + c2))
+    s = ((2 * mu_x * mu_y + c1) * (2 * sxy + c2)) / (
+        (mu_x**2 + mu_y**2 + c1) * (sxx + syy + c2)
+    )
     return s.flatten(1).mean(1)
 
 
@@ -86,10 +92,19 @@ def revisit_pairs(
 
 def _steady(stats: dict, name: str, warmup: int) -> list[float]:
     rows = [s for s in stats["samples"] if s["name"] == name]
-    return [s["value"] for s in rows if s["step_index"] >= warmup] or [s["value"] for s in rows]
+    return [s["value"] for s in rows if s["step_index"] >= warmup] or [
+        s["value"] for s in rows
+    ]
 
 
-def run_metrics(run: Path, pairs: list[tuple[int, int]], warmup: int) -> dict:
+def run_metrics(
+    run: Path,
+    pairs: list[tuple[int, int]],
+    warmup: int,
+    far_gap: int,
+    x0: float = 0.0,
+    len_t: int = 4,
+) -> dict:
     """Speed, memory, and video metrics for one run directory."""
     import imageio.v3 as iio
 
@@ -98,18 +113,26 @@ def run_metrics(run: Path, pairs: list[tuple[int, int]], warmup: int) -> dict:
     total = sorted(_steady(stats, "total_s", warmup))
     out["chunk_s_median"] = statistics.median(total)
     out["chunk_s_p90"] = total[min(len(total) - 1, int(0.9 * len(total)))]
-    out["fps"] = FRAMES_PER_CHUNK / out["chunk_s_median"]
+    out["fps"] = len_t * VAE_STRIDE_T / out["chunk_s_median"]
     out["gpu_peak_gib"] = max(_steady(stats, "mem_peak_gib", 0))
-    rss = re.search(r"Maximum resident set size \(kbytes\): (\d+)", (run / "run.log").read_text())
+    rss = re.search(
+        r"Maximum resident set size \(kbytes\): (\d+)", (run / "run.log").read_text()
+    )
     out["host_rss_gib"] = int(rss.group(1)) / 2**20 if rss else None
     frames = torch.from_numpy(iio.imread(run / "out.mp4", plugin="pyav"))
+    frames = frames[:, :, int(x0 * frames.shape[2]) :]  # drop the burned-in UI panel
     out["frames"] = len(frames)
     pairs = [(i, j) for i, j in pairs if j < len(frames)]
     if pairs:
         src, dst = frames[[i for i, _ in pairs]], frames[[j for _, j in pairs]]
+        p, s = psnr(src, dst), ssim(src, dst)
+        far = torch.tensor([j - i >= far_gap for i, j in pairs])
         out["revisit_pairs"] = len(pairs)
-        out["revisit_psnr"] = psnr(src, dst).mean().item()
-        out["revisit_ssim"] = ssim(src, dst).mean().item()
+        out["revisit_psnr"], out["revisit_ssim"] = p.mean().item(), s.mean().item()
+        for tag, m in (("near", ~far), ("far", far)):  # split by revisit distance
+            if m.any():
+                out[f"revisit_psnr_{tag}"] = p[m].mean().item()
+                out[f"revisit_ssim_{tag}"] = s[m].mean().item()
     sharp = sharpness(frames)
     q = max(1, len(frames) // 4)
     out["sharpness"] = sharp.mean().item()
@@ -120,27 +143,37 @@ def run_metrics(run: Path, pairs: list[tuple[int, int]], warmup: int) -> dict:
 
 def summarize(out_dir: Path, poses: np.ndarray, args: argparse.Namespace) -> list[dict]:
     """Compute metrics for every finished run and write metrics.json / metrics.md."""
-    pairs = revisit_pairs(poses, min_gap=args.min_gap, max_deg=args.max_deg, min_src=args.min_src)
+    pairs = revisit_pairs(
+        poses, min_gap=args.min_gap, max_deg=args.max_deg, min_src=args.min_src
+    )
     rows = []
     for run in sorted(p for p in out_dir.iterdir() if (p / "ok").exists()):
-        rows.append(run_metrics(run, pairs, args.warmup))
+        rows.append(
+            run_metrics(run, pairs, args.warmup, args.far_gap, args.x0, args.len_t)
+        )
     base = next((r for r in rows if r["run"] == args.baseline), None)
     for r in rows:
         if base is not None and r is not base:
             n = min(len(r["_frames"]), len(base["_frames"]))
-            r["psnr_vs_baseline"] = psnr(r["_frames"][:n], base["_frames"][:n]).mean().item()
+            r["psnr_vs_baseline"] = (
+                psnr(r["_frames"][:n], base["_frames"][:n]).mean().item()
+            )
     for r in rows:
         del r["_frames"]
     (out_dir / "metrics.json").write_text(json.dumps(rows, indent=2))
     cols = [
         "run", "chunk_s_median", "chunk_s_p90", "fps", "gpu_peak_gib", "host_rss_gib",
-        "revisit_psnr", "revisit_ssim", "sharpness", "sharpness_late_over_early",
-        "psnr_vs_baseline",
+        "revisit_psnr", "revisit_ssim", "revisit_psnr_near", "revisit_psnr_far",
+        "sharpness", "sharpness_late_over_early", "psnr_vs_baseline",
     ]  # fmt: skip
     fmt = lambda v: f"{v:.3f}" if isinstance(v, float) else str("-" if v is None else v)  # noqa: E731
     md = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
     md += ["| " + " | ".join(fmt(r.get(c)) for c in cols) + " |" for r in rows]
-    md.append(f"\n{len(pairs)} revisit pairs (min gap {args.min_gap}, < {args.max_deg} deg).")
+    n_far = sum(j - i >= args.far_gap for i, j in pairs)
+    md.append(
+        f"\n{len(pairs)} revisit pairs (min gap {args.min_gap}, < {args.max_deg} deg; "
+        f"near < {args.far_gap} frames: {len(pairs) - n_far}, far: {n_far})."
+    )
     (out_dir / "metrics.md").write_text("\n".join(md) + "\n")
     print("\n".join(md))
     return rows
@@ -152,7 +185,11 @@ def self_check() -> None:
     poses = np.tile(np.eye(4), (6, 1, 1))
     poses[:, 0, 0] = poses[:, 2, 2] = np.cos(yaw)
     poses[:, 0, 2], poses[:, 2, 0] = np.sin(yaw), -np.sin(yaw)
-    assert revisit_pairs(poses, min_gap=2, max_deg=1, min_src=0) == [(1, 3), (0, 4), (0, 5)]
+    assert revisit_pairs(poses, min_gap=2, max_deg=1, min_src=0) == [
+        (1, 3),
+        (0, 4),
+        (0, 5),
+    ]
     assert revisit_pairs(poses, min_gap=2, max_deg=1, min_src=1) == [(1, 3)]
     g = torch.Generator().manual_seed(0)
     a = torch.randint(0, 256, (2, 32, 32, 3), dtype=torch.uint8, generator=g)
@@ -167,13 +204,28 @@ def self_check() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("out_dir", nargs="?", type=Path)
-    parser.add_argument("--poses", type=Path, help="raw [T, 4, 4] poses given to --pose-path")
+    parser.add_argument(
+        "--poses", type=Path, help="raw [T, 4, 4] poses given to --pose-path"
+    )
     parser.add_argument("--len-t", type=int, default=4)
     parser.add_argument("--baseline", default="baseline")
     parser.add_argument("--warmup", type=int, default=2)
-    parser.add_argument("--min-gap", type=int, default=64, help="> baseline window (48 frames)")
+    parser.add_argument(
+        "--min-gap", type=int, default=64, help="> baseline window (48 frames)"
+    )
     parser.add_argument("--max-deg", type=float, default=2.0)
-    parser.add_argument("--min-src", type=int, default=24, help="skip sink frames as sources")
+    parser.add_argument(
+        "--min-src", type=int, default=24, help="skip sink frames as sources"
+    )
+    parser.add_argument(
+        "--far-gap", type=int, default=200,
+        help="near/far split of revisit pairs (pixel frames); 200 sits between "
+        "WorldKV R_L_R_L_R_L90_360's two gap clusters (~120-190 and ~240-300)",
+    )  # fmt: skip
+    parser.add_argument(
+        "--x0", type=float, default=0.5,
+        help="keep only columns x >= x0 * width (UI panel ends at ~0.45 W); 0 = full frame",
+    )  # fmt: skip
     parser.add_argument("--self-check", action="store_true")
     args = parser.parse_args()
     if args.self_check:
@@ -183,7 +235,9 @@ def main() -> None:
     # Same pose resampling the model sees, so frame j lines up with poses[j].
     from lingbot.impl.encoder.utils import preprocess_example_poses
 
-    poses, _ = preprocess_example_poses(np.load(args.poses), transformer_len_t=args.len_t)
+    poses, _ = preprocess_example_poses(
+        np.load(args.poses), transformer_len_t=args.len_t
+    )
     summarize(args.out_dir, poses, args)
 
 
