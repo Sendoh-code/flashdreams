@@ -9,10 +9,12 @@ from ``KV_SWEEP_WINDOW_T``, ``KV_SWEEP_SINK_T``, and ``KV_SWEEP_OFFLOAD=1``.
 (default 8), ``KV_SWEEP_BANK_GRANULARITY`` (``chunk``/``frame``), and
 ``KV_SWEEP_RETRIEVE_GAP_T`` (``CameraPoseRetrieval.min_gap_t``, default 0);
 without offload the caches stay resident and only retrieved entries are copied
-in. ``KV_SWEEP_ROPE=pre`` caches K before RoPE (cache-relative positions)
+in. ``KV_SWEEP_POLICY=landmark`` swaps in WorldTrace's ``LandmarkRetrieval``
+(``KV_SWEEP_LANDMARK_TAU``, default 0.5). ``KV_SWEEP_ROPE=pre`` caches K before RoPE (cache-relative positions)
 instead of the default ``post``. ``KV_SWEEP_MODEL`` picks the base preset:
 ``1p3b`` (default), ``14b`` (v2 14B causal-fast), or ``v1fast`` (v1
 LingBot-World-Fast 14B, the model WorldKV uses).
+``KV_SWEEP_CUDA_GRAPH=1`` replays the network from a CUDA graph (no offload, no bank).
 """
 
 from __future__ import annotations
@@ -20,7 +22,11 @@ from __future__ import annotations
 import os
 
 from flashdreams.api_v2.application import IApplication
-from flashdreams.core.attention import CameraPoseRetrieval, KVBankConfig
+from flashdreams.core.attention import (
+    CameraPoseRetrieval,
+    KVBankConfig,
+    LandmarkRetrieval,
+)
 from flashdreams.infra.config import derive_config
 from lingbot.apps.cam2v.adapter import LingbotCam2VApplication
 from lingbot.config import (
@@ -56,7 +62,13 @@ def create_app() -> IApplication:
             budget_gb=float(os.environ.get("KV_SWEEP_BANK_GB", "8")),
             granularity=os.environ.get("KV_SWEEP_BANK_GRANULARITY", "chunk"),  # type: ignore[arg-type]
             retrieve_size_t=retrieve_t,
-            policy=CameraPoseRetrieval(
+            # KV_SWEEP_POLICY=landmark: WorldTrace's Landmark writer; run it with
+            # KV_SWEEP_BANK_GRANULARITY=frame KV_SWEEP_ROPE=pre.
+            policy=LandmarkRetrieval(
+                threshold=float(os.environ.get("KV_SWEEP_LANDMARK_TAU", "0.5"))
+            )
+            if os.environ.get("KV_SWEEP_POLICY") == "landmark"
+            else CameraPoseRetrieval(
                 min_gap_t=int(os.environ.get("KV_SWEEP_RETRIEVE_GAP_T", "0"))
             ),
         )
@@ -77,9 +89,10 @@ def create_app() -> IApplication:
                 sink_size_t=sink_t,
                 kv_offload=offload,
                 kv_bank=bank,
-                # Offload and the bank hook every layer; keep every arm
-                # graph-free (the 1.3B preset already is, the 14B ones are not).
-                use_cuda_graph=False,
+                # Offload and the bank hook every layer, so they need graphs off
+                # (the 14B presets have them on). KV_SWEEP_CUDA_GRAPH=1 turns
+                # them on for a bank-free resident arm.
+                use_cuda_graph=os.environ.get("KV_SWEEP_CUDA_GRAPH") == "1",
             ),
         ),
     )

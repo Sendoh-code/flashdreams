@@ -279,12 +279,36 @@ H2D 字节数不变（每层每条目一次拷贝，frame 粒度下拷贝调用�
 | `core/attention/kvbank.py` | 104–122 | `CameraPoseRetrieval.min_gap_t`：跳过结束位置距 query 不足这么多帧的候选 |
 | `recipes/wan/transformer/wan21.py` | 204–210, 298, 513–522 | `kv_bank` 不再要求 `kv_offload`；两者任一都禁 CUDA graph；`resident=not cfg.kv_offload` |
 | `integrations_v2/lingbot/apps/cam2v/kv_sweep.py` | 35, 49, 60 | `KV_SWEEP_MODEL=v1fast`；检索不再隐含 offload；`KV_SWEEP_RETRIEVE_GAP_T` |
-| `experiments/kv_offload/compare.slurm` | 22–27, 77, 94–95, 105 | `wkv-*` run、可选第 6 个参数 retrieve gap、`APP_ARGS`、`METRIC_ARGS` |
+| `experiments/kv_offload/compare.slurm` | 22–28, 78, 95–96, 106 | `wkv-*` run（含 `wkv-slide`：window 15 / sink 3，WorldKV 自己的滑窗 baseline）、可选第 6 个参数 retrieve gap、`APP_ARGS`、`METRIC_ARGS` |
+| `experiments/kv_offload/compare_metrics.py` | 94, 112, 133, 245 | `video_poses`（原始逐帧 pose；`--stretch-poses` 对应 WorldKV 把 360 个 pose 摊到整段视频）；`run_metrics` 去掉 mp4 开头的等待帧，`stats.json` / `run.log` 可选（2026-11-26，未提交） |
 | `experiments/kv_offload/latent_parity.py` | 全文件 | dump `WanVAE.decode` 的输入 latent，`--compare` 逐位比较 |
 
 **测试**：`test_kvcache.py` 252（每 4 个 chunk 有一次空检索，覆盖 sink 恢复）、262/275（bank 测试按
 `resident` 参数化）、377（`min_gap_t`）。`ci_cpu` 23 / `ci_gpu` 15 passed。端到端：eager 1.3B 下 resident
 与 offload 的 latent 逐位相同（`WORLDCACHE_EXPERIMENTS.md` §2.3）。
+
+---
+
+## 9. WorldTrace Landmark 策略（2026-11-26/27）
+
+WorldTrace（arXiv 2608.07408）的 Landmark writer，作为一个 `KVRetrievalPolicy`：retrieve 区放最新的 k 个
+「场景入口」帧（该帧的 key 与前一帧 key 的余弦距离 > `threshold`）。配合 frame 粒度 + pre-RoPE（§4）使用：
+bank 里存的就是论文的 canonical key，retrieve 槽位就是按槽位序决定的虚拟位置。Field / combined writer 要合成新的
+K/V，不是「选条目」，没有实现（原因见 `WORLDCACHE.md`）。
+
+| 文件 | 行号 | 内容 |
+| --- | --- | --- |
+| `core/attention/kvbank.py` | 144–188 | `LandmarkRetrieval`：`threshold`（156，论文没给值）、`layer`（160，比较哪个已注册 cache 的 key，默认中间层；第 0 层的距离恒约 0.005，不可用）；`select` 给每个候选只算一次 `meta["key_dist"]`，没有前驱条目的帧记为 `inf`；不足 k 个时用最旧的 landmark 补齐（186–188） |
+| `core/attention/__init__.py` | 13, 41 | 导出 |
+| `integrations_v2/lingbot/apps/cam2v/kv_sweep.py` | 12–13, 17, 65–72, 92–95 | `KV_SWEEP_POLICY=landmark`、`KV_SWEEP_LANDMARK_TAU`；`KV_SWEEP_CUDA_GRAPH=1` 给不带 bank / offload 的 arm 打开整网 CUDA graph（上限实验用） |
+| `experiments/kv_offload/compare.slurm` | 27–31, 72–78, 104 | run `wt-landmark`（window 16 / sink 0 / 2 个 landmark 槽，常驻）、`wt-landmark6`（6 槽 + window 12）、`wt-slide`（window 18，无 sink）；`run_one` 第 7 个参数 policy，`landmark` 时用 pre-RoPE + frame 粒度 |
+| `experiments/kv_offload/compare_metrics.py` | 80–110, 183–190, 221–227, 295–299 | `--perceptual`：在同一批 revisit 帧对上加 WorldTrace 的 DINOv2 ViT-S/14 CLS 余弦和 LPIPS-VGG（`perceptual()`），需要 `lpips`（`uv run --with lpips`） |
+
+**测试**：`flashdreams/tests/test_kvcache.py:383` `test_landmark_retrieval_keeps_newest_scene_entries`（`ci_cpu`）：
+场景序列 `AABBBAAAAA`，检查 retrieve 槽位依次为 [0,0]、[0,2]、[2,5]。`ci_cpu` 24 passed。GPU 端到端结果见 `WORLDCACHE_EXPERIMENTS.md` §2.6。
+
+组合写入器（combined）没有实现：它要合成新的 K/V 并用每层 query 算注意力响应误差，而 `select` 只能返回 bank 里已有的条目、
+每个 chunk 调一次且各层共用。支持它需要给 bank 加「写入」路径并暴露每层 query，目前决定不改接口。
 
 ---
 

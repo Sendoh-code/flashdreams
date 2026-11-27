@@ -20,10 +20,17 @@
 # WorldKV setting (MODEL=v1fast BLOCKS=30: v1 LingBot-World-Fast 14B, len_t 3, 18
 # attended frames; mirrors WorldKV generate_fast.py, wr9 = 3 retrieved chunks, no compression):
 #   wkv-baseline resident window 12 / sink 6 (the v2 README policy, also 18 frames)
+#   wkv-slide    resident window 15 / sink 3 (WorldKV's own sliding baseline, sink3-recent15)
 #   wkv-resident resident sink 3 + 9 retrieved + window 6, bank on host, retrieval
 #                skips the 6 frames before the chunk (WorldKV --use_retrieval --retrieval_frames 9)
 #   wkv-ours     wkv-resident with layerwise offload
+#   wt-landmark  WorldTrace Landmark writer in its LingBot layout (N_s 2 + N_r 16, no sink):
+#                resident, frame bank, pre-RoPE, 2 newest scene-entry frames (KV_SWEEP_LANDMARK_TAU)
+#   wt-landmark6 same with 6 landmark slots + window 12: a transit of the dwell-and-return
+#                trajectories (WorldKV/traj/_W_S__177 etc., 6-7 moving latent frames) fits the slots
+#   wt-slide     resident window 18, no sink (WorldTrace's sliding baseline, same 18 frames)
 # with METRIC_ARGS="--len-t 3 --min-src 12 --min-gap 80 --baseline wkv-baseline" (WorldKV eval.py pairs).
+# RUNNER replaces flashdreams-run-v2 (e.g. "python latent_parity.py" with LATENT_DIR, to keep the latents).
 # APP_ARGS is appended to the app args (e.g. --no-compile: compiled runs are not
 # reproducible, eager ones are bit-identical). SEED (default 42) sets the generation seed. MODEL=14b runs the v2 14B causal-fast
 # preset instead of the 1.3B (MODEL=1p3b); both use len_t 4.
@@ -62,14 +69,15 @@ BLOCKS=${BLOCKS:-22}  # 360 poses -> 88 latent frames -> 22 chunks of 4
 MODEL=${MODEL:-1p3b}  # kv_sweep validates it
 { nvidia-smi -L; git rev-parse HEAD; echo "MODEL=$MODEL POSES=$POSES BLOCKS=$BLOCKS"; } | tee -a "$OUT/env.txt"
 
-run_one() {  # name window sink retrieve offload [retrieve-gap]
-  local name=$1 dir="$OUT/$1"
+run_one() {  # name window sink retrieve offload [retrieve-gap] [policy]
+  local name=$1 dir="$OUT/$1" rope=post gran=chunk
+  [[ ${7:-} == landmark ]] && rope=pre gran=frame  # canonical keys, one slot per latent frame
   mkdir -p "$dir"
   echo "=== $name ($(date +%T))"
   KV_SWEEP_MODEL=$MODEL KV_SWEEP_WINDOW_T=$2 KV_SWEEP_SINK_T=$3 KV_SWEEP_RETRIEVE_T=$4 KV_SWEEP_OFFLOAD=$5 KV_SWEEP_RETRIEVE_GAP_T=${6:-0} \
-  KV_SWEEP_ROPE=post KV_SWEEP_BANK_GRANULARITY=chunk KV_SWEEP_BANK_GB=${BANK_GB:-24} \
+  KV_SWEEP_POLICY=${7:-pose} KV_SWEEP_ROPE=$rope KV_SWEEP_BANK_GRANULARITY=$gran KV_SWEEP_BANK_GB=${BANK_GB:-24} \
   FLASHDREAMS_KV_OFFLOAD_TIMING_JSONL=${FLASHDREAMS_KV_OFFLOAD_TIMING:+$dir/kv_timing.jsonl} \
-  timeout "${RUN_TIMEOUT:-1500}" /usr/bin/time -v "$PY/flashdreams-run-v2" lingbot.apps.cam2v.kv_sweep \
+  timeout "${RUN_TIMEOUT:-1500}" /usr/bin/time -v ${RUNNER:-"$PY/flashdreams-run-v2"} lingbot.apps.cam2v.kv_sweep \
     --mode mp4 --output-path "$dir/out.mp4" --timeout unbound \
     --backpressure-mode block --presentation-mode on_demand \
     --stats-path "$dir/stats.json" \
@@ -87,12 +95,13 @@ run_one() {  # name window sink retrieve offload [retrieve-gap]
   echo "$name status=$status" | tee -a "$OUT/summary.txt"
 }
 
-declare -A ARGS=(  # name -> window sink retrieve offload [retrieve-gap]
+declare -A ARGS=(  # name -> window sink retrieve offload [retrieve-gap] [policy]
   [baseline]="12 6 0 0" [resident-w40]="40 6 0 0"
   [offload-w40]="40 6 0 1" [ours]="40 6 8 1"
   [ours-w8]="8 6 8 1"
-  [wkv-baseline]="12 6 0 0"
+  [wkv-baseline]="12 6 0 0" [wkv-slide]="15 3 0 0"
   [wkv-resident]="6 3 9 0 6" [wkv-ours]="6 3 9 1 6"
+  [wt-landmark]="16 0 2 0 0 landmark" [wt-landmark6]="12 0 6 0 0 landmark" [wt-slide]="18 0 0 0"
 )
 for name in ${RUNS:-baseline resident-w40 offload-w40 ours}; do
   if [[ -n ${ARGS[$name]:-} ]]; then args=${ARGS[$name]}

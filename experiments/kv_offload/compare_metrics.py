@@ -6,14 +6,17 @@
 Usage: ``python compare_metrics.py <out_dir> --poses <poses.npy> [--baseline NAME]``
 or ``python compare_metrics.py --self-check``.
 
-Per run (``<out_dir>/<run>/`` with ``out.mp4``, ``stats.json``, ``run.log``):
+Per run (``<out_dir>/<run>/`` with ``out.mp4``; ``stats.json`` and ``run.log`` add
+speed and memory, so videos from other code bases can be scored too):
 
 - speed: median / p90 chunk time after warmup and the implied FPS;
 - memory: peak GPU memory (``mem_peak_gib``) and host max RSS (``/usr/bin/time -v``);
 - revisit consistency: PSNR / SSIM between frame ``j`` and the first earlier frame
   ``i`` with the same camera pose (rotation < ``--max-deg``) at least ``--min-gap``
   frames back, skipping sources inside the sink; also split into near / far
-  pairs at ``--far-gap`` frames apart;
+  pairs at ``--far-gap`` frames apart; ``--perceptual`` adds WorldTrace's pair
+  metrics, DINOv2 ViT-S/14 CLS cosine and LPIPS-VGG (needs ``lpips``, e.g.
+  ``uv run --with lpips``; downloads both models);
 - no-reference quality proxies: Laplacian sharpness and its last/first quarter
   ratio (blur drift), plus PSNR vs the baseline run (divergence, not quality).
 
@@ -74,6 +77,39 @@ def sharpness(frames: torch.Tensor) -> torch.Tensor:
     return F.conv2d(_gray(frames), k).flatten(1).var(1)
 
 
+def perceptual(
+    src: torch.Tensor, dst: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-pair DINOv2 CLS cosine and LPIPS-VGG of uint8 ``[N, H, W, 3]`` frames (WorldTrace App. E)."""
+    import lpips
+    from transformers import AutoModel
+
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    dino = AutoModel.from_pretrained("facebook/dinov2-small").to(dev).eval()
+    vgg = lpips.LPIPS(net="vgg", verbose=False).to(dev)
+    mean = torch.tensor([0.485, 0.456, 0.406], device=dev)[:, None, None]
+    std = torch.tensor([0.229, 0.224, 0.225], device=dev)[:, None, None]
+    cos, lp = [], []
+    with torch.no_grad():
+        for a, b in zip(src.split(16), dst.split(16)):
+            a, b = (x.to(dev).permute(0, 3, 1, 2).float() / 255 for x in (a, b))
+            lp.append(vgg(a, b, normalize=True).flatten().cpu())
+            # The paper feeds 252x448; keep that height and round the width to the
+            # patch size, since the UI-panel crop changes the aspect ratio.
+            size = (252, max(14, round(252 * a.shape[3] / a.shape[2] / 14) * 14))
+            fa, fb = (
+                dino(
+                    pixel_values=(
+                        F.interpolate(x, size, mode="bilinear", antialias=True) - mean
+                    )
+                    / std
+                ).last_hidden_state[:, 0]
+                for x in (a, b)
+            )
+            cos.append(F.cosine_similarity(fa, fb).cpu())
+    return torch.cat(cos), torch.cat(lp)
+
+
 def revisit_pairs(
     poses: np.ndarray, *, min_gap: int, max_deg: float, min_src: int
 ) -> list[tuple[int, int]]:
@@ -90,6 +126,17 @@ def revisit_pairs(
     return pairs
 
 
+def video_poses(raw: np.ndarray, n_frames: int, stretch: bool) -> np.ndarray:
+    """Raw pose of each decoded pixel frame.
+
+    flashdreams keeps the first ``4k + 1`` raw poses, so frame ``f`` is ``raw[f]``;
+    with ``stretch`` (WorldKV ``generate_fast.py``) the frames span all raw poses.
+    """
+    if stretch:
+        return raw[np.round(np.linspace(0, len(raw) - 1, n_frames)).astype(int)]
+    return raw[:n_frames]
+
+
 def _steady(stats: dict, name: str, warmup: int) -> list[float]:
     rows = [s for s in stats["samples"] if s["name"] == name]
     return [s["value"] for s in rows if s["step_index"] >= warmup] or [
@@ -98,59 +145,64 @@ def _steady(stats: dict, name: str, warmup: int) -> list[float]:
 
 
 def run_metrics(
-    run: Path,
-    pairs: list[tuple[int, int]],
-    warmup: int,
-    far_gap: int,
-    x0: float = 0.0,
-    len_t: int = 4,
-) -> dict:
-    """Speed, memory, and video metrics for one run directory."""
+    run: Path, raw_poses: np.ndarray, args: argparse.Namespace
+) -> tuple[dict, list[tuple[int, int]]]:
+    """Speed, memory, and video metrics for one run directory, plus its revisit pairs."""
     import imageio.v3 as iio
 
+    far_gap, x0 = args.far_gap, args.x0
     out: dict = {"run": run.name}
-    stats = json.loads((run / "stats.json").read_text())
-    total = sorted(_steady(stats, "total_s", warmup))
-    out["chunk_s_median"] = statistics.median(total)
-    out["chunk_s_p90"] = total[min(len(total) - 1, int(0.9 * len(total)))]
-    out["fps"] = len_t * VAE_STRIDE_T / out["chunk_s_median"]
-    out["gpu_peak_gib"] = max(_steady(stats, "mem_peak_gib", 0))
-    rss = re.search(
-        r"Maximum resident set size \(kbytes\): (\d+)", (run / "run.log").read_text()
-    )
+    if (run / "stats.json").exists():
+        stats = json.loads((run / "stats.json").read_text())
+        total = sorted(_steady(stats, "total_s", args.warmup))
+        out["chunk_s_median"] = statistics.median(total)
+        out["chunk_s_p90"] = total[min(len(total) - 1, int(0.9 * len(total)))]
+        out["fps"] = args.len_t * VAE_STRIDE_T / out["chunk_s_median"]
+        out["gpu_peak_gib"] = max(_steady(stats, "mem_peak_gib", 0))
+    log = (run / "run.log").read_text() if (run / "run.log").exists() else ""
+    rss = re.search(r"Maximum resident set size \(kbytes\): (\d+)", log)
     out["host_rss_gib"] = int(rss.group(1)) / 2**20 if rss else None
     frames = torch.from_numpy(iio.imread(run / "out.mp4", plugin="pyav"))
+    # The VAE decodes 4k + 1 frames; anything before that is a presentation
+    # frame (flashdreams records one "waiting" frame first).
+    frames = frames[(len(frames) - 1) % VAE_STRIDE_T :]
     frames = frames[:, :, int(x0 * frames.shape[2]) :]  # drop the burned-in UI panel
     out["frames"] = len(frames)
-    pairs = [(i, j) for i, j in pairs if j < len(frames)]
+    pairs = revisit_pairs(
+        video_poses(raw_poses, len(frames), args.stretch_poses),
+        min_gap=args.min_gap,
+        max_deg=args.max_deg,
+        min_src=args.min_src,
+    )
     if pairs:
         src, dst = frames[[i for i, _ in pairs]], frames[[j for _, j in pairs]]
         p, s = psnr(src, dst), ssim(src, dst)
         far = torch.tensor([j - i >= far_gap for i, j in pairs])
         out["revisit_pairs"] = len(pairs)
         out["revisit_psnr"], out["revisit_ssim"] = p.mean().item(), s.mean().item()
+        metrics = {"psnr": p, "ssim": s}
+        if args.perceptual:
+            metrics["dino"], metrics["lpips"] = perceptual(src, dst)
+            out["revisit_dino"] = metrics["dino"].mean().item()
+            out["revisit_lpips"] = metrics["lpips"].mean().item()
         for tag, m in (("near", ~far), ("far", far)):  # split by revisit distance
             if m.any():
-                out[f"revisit_psnr_{tag}"] = p[m].mean().item()
-                out[f"revisit_ssim_{tag}"] = s[m].mean().item()
+                for name, v in metrics.items():
+                    out[f"revisit_{name}_{tag}"] = v[m].mean().item()
     sharp = sharpness(frames)
     q = max(1, len(frames) // 4)
     out["sharpness"] = sharp.mean().item()
     out["sharpness_late_over_early"] = (sharp[-q:].mean() / sharp[:q].mean()).item()
     out["_frames"] = frames
-    return out
+    return out, pairs
 
 
 def summarize(out_dir: Path, poses: np.ndarray, args: argparse.Namespace) -> list[dict]:
-    """Compute metrics for every finished run and write metrics.json / metrics.md."""
-    pairs = revisit_pairs(
-        poses, min_gap=args.min_gap, max_deg=args.max_deg, min_src=args.min_src
-    )
-    rows = []
+    """Compute metrics for every finished run (``ok`` marker) from raw ``poses``."""
+    rows, pairs = [], []
     for run in sorted(p for p in out_dir.iterdir() if (p / "ok").exists()):
-        rows.append(
-            run_metrics(run, pairs, args.warmup, args.far_gap, args.x0, args.len_t)
-        )
+        row, pairs = run_metrics(run, poses, args)
+        rows.append(row)
     base = next((r for r in rows if r["run"] == args.baseline), None)
     for r in rows:
         if base is not None and r is not base:
@@ -166,6 +218,13 @@ def summarize(out_dir: Path, poses: np.ndarray, args: argparse.Namespace) -> lis
         "revisit_psnr", "revisit_ssim", "revisit_psnr_near", "revisit_psnr_far",
         "sharpness", "sharpness_late_over_early", "psnr_vs_baseline",
     ]  # fmt: skip
+    if args.perceptual:
+        cols[8:8] = [
+            "revisit_dino",
+            "revisit_lpips",
+            "revisit_dino_far",
+            "revisit_lpips_far",
+        ]
     fmt = lambda v: f"{v:.3f}" if isinstance(v, float) else str("-" if v is None else v)  # noqa: E731
     md = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
     md += ["| " + " | ".join(fmt(r.get(c)) for c in cols) + " |" for r in rows]
@@ -191,6 +250,9 @@ def self_check() -> None:
         (0, 5),
     ]
     assert revisit_pairs(poses, min_gap=2, max_deg=1, min_src=1) == [(1, 3)]
+    raw = np.arange(9)
+    assert video_poses(raw, 5, False).tolist() == [0, 1, 2, 3, 4]
+    assert video_poses(raw, 5, True).tolist() == [0, 2, 4, 6, 8]
     g = torch.Generator().manual_seed(0)
     a = torch.randint(0, 256, (2, 32, 32, 3), dtype=torch.uint8, generator=g)
     b = torch.randint(0, 256, (2, 32, 32, 3), dtype=torch.uint8, generator=g)
@@ -226,19 +288,24 @@ def main() -> None:
         "--x0", type=float, default=0.5,
         help="keep only columns x >= x0 * width (UI panel ends at ~0.45 W); 0 = full frame",
     )  # fmt: skip
+    parser.add_argument(
+        "--stretch-poses", action="store_true",
+        help="frames span all raw poses (WorldKV generate_fast.py videos)",
+    )  # fmt: skip
+    parser.add_argument(
+        "--perceptual",
+        action="store_true",
+        help="add revisit DINOv2 cosine and LPIPS-VGG",
+    )
     parser.add_argument("--self-check", action="store_true")
     args = parser.parse_args()
     if args.self_check:
         return self_check()
     if args.out_dir is None or args.poses is None:
         parser.error("out_dir and --poses are required")
-    # Same pose resampling the model sees, so frame j lines up with poses[j].
-    from lingbot.impl.encoder.utils import preprocess_example_poses
-
-    poses, _ = preprocess_example_poses(
-        np.load(args.poses), transformer_len_t=args.len_t
-    )
-    summarize(args.out_dir, poses, args)
+    # Raw poses, one per pixel frame: the camera moves smoothly within a latent
+    # frame, so the per-latent poses the model takes would misalign pairs.
+    summarize(args.out_dir, np.load(args.poses), args)
 
 
 if __name__ == "__main__":

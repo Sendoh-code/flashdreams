@@ -298,14 +298,204 @@ Same bf16 `kv_sweep` app and `compare.slurm` runs as the A100 job, run with
 - Tool: `experiments/kv_offload/latent_parity.py` dumps decoded latents and
   compares two dumps; `compare.slurm` passes `APP_ARGS` (e.g. `--no-compile`).
 
+### WorldKV head-to-head, eager, aligned metric (2026-11-26)
+
+- Eager reruns settle the 11-25 questions. v1fast 14B, 30 chunks, bank 120 GB:
+  `wkv-resident` and `wkv-ours` give the same revisit PSNR per seed (13.05 /
+  9.01 / 14.94 vs 13.05 / 9.00 / 14.94), so the compiled "ours < resident"
+  was noise on 14B too. Eager 14B is as fast as compiled (~4.4 s/chunk).
+- The bank must hold the whole history: 24 GB keeps only ~6 chunks of 14B KV.
+  Use `BANK_GB=120` (host RSS ~183 GiB).
+- Baselines differ: sink 6 + window 12 (`wkv-baseline`) beats WorldKV's own
+  sink 3 + recent 15 by ~0.7 dB on the dragon scene. New run `wkv-slide`
+  (window 15 / sink 3) is the like-for-like baseline. The ~2 dB absolute gap
+  to WorldKV's published baseline was the scene: flashdreams example 0 (dragon
+  rider) vs WorldKV `examples/new/00.png` (village). Camera yaw gain is ~1.0
+  in both codebases.
+- `compare_metrics.py` was misaligned: it used per-latent (piecewise constant)
+  poses and kept the leading black "waiting" frame of the mp4. It now drops
+  the leading frame(s), pairs on raw per-frame poses, and has
+  `--stretch-poses` for WorldKV videos (which spread all 360 poses over the
+  video). `stats.json` / `run.log` are optional so it scores WorldKV outputs.
+- Retrieval picks match WorldKV's selection in 23/26 chunks (offline replay;
+  the rest come from a ~1 degree pose-sampling offset).
+- Final comparison, WorldKV scene, seeds 42–45, every arm 18 attended latent
+  frames, flashdreams eager (`/mnt/datastore/yiti6755/kv_offload/wkv-1126-final/`,
+  `results.md`). Revisit PSNR / SSIM, mean over seeds:
+
+  | arm | PSNR | SSIM | s/chunk | video fps | GPU GiB | host RSS GiB |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | flashdreams `wkv-slide` | 12.97 | 0.37 | 4.44 | 2.70 | 66.8 | 70.2 |
+  | flashdreams `wkv-ours` | 13.13 | 0.38 | 4.50 | 2.67 | 47.5 | 182.7 |
+  | WorldKV `sink3-recent15` | 12.59 | 0.35 | 5.83 | 1.76 | 59.2 | 49.7 |
+  | WorldKV `wr9` (CPU bank) | 13.92 | 0.39 | 7.84 | 1.36 | 78.5 | 152.8 |
+
+  fps is decoded video frames (12 per chunk) per second, decode included.
+- **Speed: ours is 1.74x faster per chunk than WorldKV retrieval, with 31 GiB
+  less GPU memory.** Retrieval costs ours +0.06 s/chunk over its sliding
+  baseline, WorldKV +2.0 s (1.48 s synchronous store to the CPU bank, 0.36 s
+  retrieve). Part of the 1.74x is the framework: WorldKV's sliding baseline is
+  itself 1.3x slower, and it ran with an SDPA fallback (no flash-attn wheel
+  for this GPU).
+- **Quality: gain over the same code's sliding baseline is not yet matched.**
+  Paired dPSNR per seed: ours +0.34 / −2.67 / +1.55 / +1.40 (mean +0.15, SSIM
+  +0.01); WorldKV +0.62 / +0.84 / +2.15 / +1.69 (mean +1.32, SSIM +0.04).
+  Seed 43 is content drift (a large horse enters the foreground from ~chunk
+  16), not numerics; without it ours is +1.10 dB. Seeds are not paired across
+  codebases (different noise), and there is one scene, so n = 4 cannot tell
+  bad luck from a real difference.
+
+### WorldKV re-check: the paper's baseline is a no-sink FIFO (2026-11-26/27)
+
+- WorldKV's code and our invocation of it are faithful to the paper: layout
+  sink 3 + 9 retrieved + recent 6 (current chunk included), same pose score,
+  and uncompressed `wr9` equals the compressed `worldkv` arm (13.57 vs 13.57
+  dB, village scene, 3 seeds).
+- The paper's +3.5 dB (LingBot 12.18 -> 15.66) is against a sliding window
+  with **no sink**. Inferred, not stated: the repo's `--sliding_window` is a
+  pure FIFO and a project-page video is named `..._sliding18_...`. Our
+  `sink3-recent15` arm is a local `--sliding_window_sink` patch. Village
+  scene, 3 seeds: fifo18 9.44, sink3-recent15 12.72, wr9 13.57.
+- Seven scenes, seed 42, the 360-frame pan
+  (`/mnt/datastore/yiti6755/kv_offload/wkv-1127-scenes/`). Revisit PSNR:
+
+  | scene | WorldKV fifo18 | WorldKV sink3-recent15 | WorldKV wr9 | flashdreams `wkv-ours` |
+  | --- | --- | --- | --- | --- |
+  | wkv00 (village) | 7.74 | 11.57 | 12.18 | 13.05 |
+  | lb00 | 7.05 | 9.03 | 9.91 | 10.09 |
+  | lb01 | 10.53 | 12.27 | 12.19 | 10.50 |
+  | lb02 | 10.06 | 11.03 | 10.79 | 9.57 |
+  | lb03 | 9.69 | 9.58 | 9.54 | 10.61 |
+  | lb04 | 8.59 | 9.56 | 8.36 | 7.36 |
+  | lb05 | 9.74 | 11.95 | 11.16 | 10.30 |
+
+  Mean over the six lb scenes: fifo18 9.28, sink 10.56, wr9 10.33. **Most of
+  the gain over FIFO comes from the sink (+1.29 dB); retrieval adds −0.24 dB
+  on top of it.** A paper-size retrieval gain shows only on the village
+  scene. The paper's 60 scene-trajectory benchmark is not released.
+
+### WorldTrace Landmark policy (2026-11-26/27)
+
+- `LandmarkRetrieval` (`core/attention/kvbank.py`) is WorldTrace's Landmark
+  writer (arXiv 2608.07408, Sec. 3.4) as a `KVRetrievalPolicy`: the retrieve
+  region holds the `k` newest scene-entry frames, a frame being a scene entry
+  when the cosine distance between its keys and the previous frame's exceeds
+  `threshold`. Spare slots repeat the oldest landmark. No pose metadata.
+- It relies on what the bank already has: frame granularity (one slot per
+  latent frame) and pre-RoPE caching, which makes the stored keys WorldTrace's
+  canonical keys and the retrieve slots its rank-ordered virtual positions.
+- Not implemented: the Field writer (slot = mean K/V of a group of evicted
+  frames; below the sliding baseline in the paper's own Table 1) and the
+  combined writer (attention-response error `E(u)` plus a verbatim bank; the
+  paper gives neither the error's penalty term nor how the bank is queried,
+  and there is no code release). Both build new K/V, which `select` cannot do.
+- Paper-unspecified choices made here: `threshold` default 0.5 (the policy
+  records each scored entry's `meta["key_dist"]`), keys compared on one
+  registered cache (`layer`, default the middle one), whole-frame cosine.
+- First GPU run (2026-11-26, v1fast 14B eager, village scene, seed 42, tau 0.5,
+  layer 0; `/mnt/datastore/yiti6755/kv_offload/wt-1126-landmark/`): runs end to
+  end on the pre-RoPE + frame-bank path, 4.76 s/chunk, GPU 66.8 GiB. No frame
+  crossed the threshold, so both slots held frame 0; revisit PSNR 11.47 vs
+  12.70 for `wkv-slide` (same scene and seed).
+- Key distance by layer (74 frames, `key_dist.jsonl`): layer 0 is ~0.005
+  throughout (useless, hence the new default). Layers 10 / 20 / 30 / 39 sit at
+  ~0.33 / 0.44 / 0.38 / 0.16 while the camera rotates and drop to ~0.10 / 0.13
+  / 0.13 / 0.03 during the trajectory's pauses. **On a continuous camera
+  trajectory the consecutive-frame distance measures camera speed, not scene
+  entry**: any threshold either marks nothing or marks every moving frame, and
+  then the 2 newest landmarks are just the 2 frames before the window.
+  Landmark as written fits discrete scene changes (the paper's MG2 ABA
+  rollouts), not this benchmark.
+- Run: `RUNS=wt-landmark` in `compare.slurm` (v1fast: window 16, no sink, 2
+  landmark slots, resident, frame bank, pre-RoPE; the paper's LingBot layout
+  N_s 2 + N_r 16), `KV_SWEEP_LANDMARK_TAU` sets the threshold. Pre-RoPE needs
+  `APP_ARGS=--no-compile`.
+- Test: `test_landmark_retrieval_keeps_newest_scene_entries` (`ci_cpu`).
+- Loop pilot (2026-11-27, `/mnt/datastore/yiti6755/kv_offload/wt-1127-loops`,
+  village scene, seed 42, eager v1fast, τ 0.25, middle layer). Dwell–move–long
+  dwell–return trajectories from `WorldKV/generate_traj.py` (`_` = dwell, 48 =
+  yaw degrees, suffix = frames). Arms all attend 18 frames: `wt-slide` pure
+  FIFO, `wkv-slide` sink 3 + 15, `wt-landmark6` 6 landmarks + 12, `wkv-ours`
+  pose retrieval. Revisit PSNR:
+
+  | trajectory | wt-slide | wkv-slide | wt-landmark6 | wkv-ours |
+  |---|---|---|---|---|
+  | `_W_S__177` | 12.88 | 13.04 | 13.08 | 14.71 |
+  | `_R_L_48_177` | 13.51 | 17.41 | 16.34 | 17.73 |
+  | `_W_R_L_48_225` | 5.76 | 14.61 | 10.90 | 14.46 |
+  | `_W_S_W_S__369` | 10.85 | 13.54 | 9.45 | 12.81 |
+
+  Landmark never beats the plain sink and costs ~0.4 s/chunk (4.78 vs 4.40).
+  Its slots hold the newest moving frames (the outbound transit during the
+  dwell, half replaced by return-leg frames once the camera moves again); the
+  start-dwell frames that the revisit is scored against are evicted by chunk 7.
+  Key distance at layer 20: moving 0.30–0.56, long dwell 0.07–0.27, but the
+  first dwell (frames 1–6) is 0.26–0.34, so τ 0.25 marks it too. One seed;
+  `wt-slide`'s 5.76 was not inspected visually.
+
+- LoopBench topologies (2026-11-27, `/mnt/datastore/yiti6755/kv_offload/wt-1127-aba`,
+  same scene/seed/arms plus `wt-landmark` 2 + 16). The paper's A/B/C are
+  camera locations reached by continuous motion, not cuts. No dwell, one
+  W/S op = 2 chunks: `WWWWSSSS_201` ABA, `WWWWWWWWSSSSSSSS_393` ABA long,
+  `WWWWSSSSWWWWSSSS_393` ABABA. Revisit PSNR (landmark arms at τ 0.25 / 0.4):
+
+  | trajectory | wt-slide | wkv-slide | wt-landmark | wt-landmark6 | wkv-ours |
+  |---|---|---|---|---|---|
+  | ABA | 8.53 | 7.10 | 7.95 / 7.91 | 7.95 / 8.32 | 6.95 |
+  | ABA long | 7.78 | 8.71 | 9.51 / 8.81 | 9.25 / 7.14 | 9.12 |
+  | ABABA | 7.92 | 7.88 | 8.42 / 7.63 | 8.45 / 8.24 | 7.61 |
+
+  Every arm is at 7–9.5 dB and none leads consistently (one seed). At τ 0.25
+  nearly every frame is marked (key distance 0.30–0.53 while walking), so the
+  landmark slots are the frames next to the window and both landmark arms see
+  the same 18 frames on ABA. τ 0.4 marks a third to two thirds of the frames
+  and is not better. A dwell-free square (`WWDDSSAA_201`) has no same-pose
+  revisit pairs; a loop needs a start dwell to be scored.
+
+- WorldTrace's own metrics (`compare_metrics.py --perceptual`: DINOv2 ViT-S/14
+  CLS cosine ↑, LPIPS-VGG ↓, on the same revisit pairs; frames are the
+  panel-free right half, DINO input 252x224) rank the ABA arms differently
+  from PSNR. DINOv2 (landmark arms at τ 0.25 / 0.4):
+
+  | trajectory | wt-slide | wkv-slide | wt-landmark | wt-landmark6 | wkv-ours |
+  |---|---|---|---|---|---|
+  | ABA | 0.38 | 0.52 | 0.41 / 0.50 | 0.41 / 0.54 | **0.63** |
+  | ABA long | 0.45 | 0.59 | 0.40 / 0.52 | 0.34 / 0.32 | **0.61** |
+  | ABABA | 0.33 | 0.55 | 0.37 / 0.46 | 0.34 / 0.46 | **0.63** |
+
+  Pose retrieval leads on all three, the sink baseline is second, and τ 0.4
+  lifts Landmark in 5 of 6 cells but not past the sink. LPIPS is 0.63–0.74
+  everywhere with no consistent order. On the dwell loops all arms but
+  `wt-slide` are at 0.84–0.89 DINOv2 except Landmark on `_W_R_L_48_225`
+  (0.67) and `_W_S_W_S__369` (0.71). One seed.
+
+### CUDA graph upper bound on 14B (2026-11-27)
+
+- Question: is a capture strategy for the bank / offload path worth designing?
+  Measured the best case first: bank-free `wkv-slide` on v1fast, whole network
+  in one graph (`KV_SWEEP_CUDA_GRAPH=1`), 30 chunks,
+  `/mnt/datastore/yiti6755/kv_offload/graph-1127`.
+- Steady diffuse per chunk (median of chunks 10–29): eager 3189 ms, eager +
+  graph 3211, compiled 3176, compiled + graph 3154. **Graphs and compile each
+  move 14B by under 2%**; a 3.2 s chunk is GPU-bound. Not worth it on 14B.
+- Capture is inferred, not logged: graph runs allocate 36 MB more
+  (static buffers). Untested on 1.3B, where launch overhead is a larger share.
+- If it ever pays: resident-bank mode only needs its per-layer hooks
+  (`LayerwiseKVOffload.before_layer` / `after_layer`) hoisted outside the
+  forward to stay one graph; layerwise offload rebinds slots between layers
+  and would need one graph per layer.
+
 ### Known gaps
 
 - End-to-end bank runs (`bank-1113-1640`, all five ok; A40 bank ≈ +26%
   s/chunk vs resident, −3.8 GiB GPU) are in `WORLDCACHE_EXPERIMENTS.md` §3.
-- Offload vs resident parity is shown bit-exact only on eager 1.3B, 8 chunks,
-  no bank eviction; not on v1fast 14B / 30 chunks.
-- No quality gain from retrieval shown yet: all quality runs so far are
-  compiled, single-recording, and within noise.
+- Offload vs resident parity is bit-exact on eager 1.3B (8 chunks, no bank
+  eviction); on v1fast 14B / 30 chunks only the metrics are shown equal.
+- Retrieval gain is +1.1 to +1.5 dB on 3 of 4 seeds but −2.7 dB on one; one
+  scene, 4 seeds. WorldKV's code is positive on 4/4. Unexplained: 3/26 chunks
+  pick differently from WorldKV.
+- Speed comparison against WorldKV uses its SDPA fallback and end-of-run VAE
+  decode (amortized per chunk in the table).
 - Each prefetch re-copies the whole visible prefix on every denoising step
   (marked `ponytail:` in `_prefetch`). Inherent to two device slots: keeping
   history across steps means keeping every layer resident. Hidden at W40 on
@@ -344,10 +534,11 @@ Same bf16 `kv_sweep` app and `compare.slurm` runs as the A100 job, run with
 4. Bank-as-only-store change: done (`compare.slurm` job 24131186; `ci_gpu`
    `test_kvcache.py` 15 passed 2026-11-25).
 5. Quality comparisons: run eager (`APP_ARGS=--no-compile`, deterministic, so
-   arms pair exactly per seed) or use >= 8 seeds compiled. First rerun the
-   WorldKV setting (`wkv-*`, v1fast) eager to answer whether retrieval helps
-   at all; then the T = 16/24/32 retrieval vs sliding comparison. Also turn
-   off the cam2v UI overlay and raise the mp4 bitrate.
+   arms pair exactly per seed). The WorldKV head-to-head needs more data
+   before claiming equal gain: several scenes / trajectories x 2–3 seeds
+   rather than more seeds on one scene. If ours stays behind, align the 3/26
+   differing picks. Then the T = 16/24/32 retrieval vs sliding comparison.
+   Also turn off the cam2v UI overlay and raise the mp4 bitrate.
 6. Design a model-agnostic KV policy interface in `core` (storage tier +
    eviction/retrieval policy) and port window/sink, full, and offload onto it.
 7. Add chunk-level KV identity and a store/lookup path (LMCache-style reuse).

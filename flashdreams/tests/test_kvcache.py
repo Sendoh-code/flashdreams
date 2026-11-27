@@ -21,6 +21,7 @@ from flashdreams.core.attention.kvbank import (
     KVBankConfig,
     KVBankEntry,
     KVRetrievalPolicy,
+    LandmarkRetrieval,
 )
 from flashdreams.core.attention.kvcache import BlockKVCache, LayerwiseKVOffload
 from flashdreams.core.attention.rope import (
@@ -376,6 +377,45 @@ def test_camera_pose_retrieval_picks_nearest_pose() -> None:
     # min_gap_t drops candidates ending within 7 frames of the query (frames 2, 3).
     picked = CameraPoseRetrieval(min_gap_t=7).select(cast(KVBank, None), query, candidates, 2)
     assert sorted(e.frame for e in picked) == [0, 1]
+
+
+@pytest.mark.ci_cpu
+def test_landmark_retrieval_keeps_newest_scene_entries() -> None:
+    """Retrieve slots hold the newest frames whose keys turned away from the previous frame's."""
+    retrieve, window = 2, 2  # frames; 1 token per frame, 1 frame per chunk
+    bank = KVBank(
+        KVBankConfig(granularity="frame", retrieve_size_t=retrieve, policy=LandmarkRetrieval()),
+        frames_per_chunk=1,
+        sink_frames=0,
+        window_frames=window,
+    )
+    offload = LayerwiseKVOffload(bank=bank)
+    cache = BlockKVCache(
+        k_shape=(1, retrieve + window, 1, 2),
+        v_shape=(1, retrieve + window, 1, 2),
+        seq_dim=1,
+        chunk_size=1,
+        window_size=window,
+        sink_size=retrieve,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    offload.add(cache)
+    scenes = "AABBBAAAAA"  # scene entries: frame 0 (rollout start), 2, 5
+    expected = {3: [0, 0], 4: [0, 2], 9: [2, 5]}  # chunk -> frames in the retrieve slots
+    for c, scene in enumerate(scenes):
+        offload.begin_chunk(c)
+        cache.before_update(c)
+        offload.before_layer([cache], 0)
+        # Key direction is the scene; its norm (frame + 1) identifies the frame.
+        k = torch.tensor([1.0, 0.0] if scene == "A" else [0.0, 1.0]).view(1, 1, 1, 2) * (c + 1)
+        cache.update(k, k)
+        if c in expected:
+            seen = (cache.cached_k()[0, :, 0].norm(dim=-1) - 1).tolist()
+            assert seen == expected[c] + [c - 1, c], (c, seen)
+        offload.after_layer([cache], 0)
+        cache.after_update(c)
+    assert bank.entries[5].meta["key_dist"] == 1.0 and bank.entries[6].meta["key_dist"] == 0.0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA streams")

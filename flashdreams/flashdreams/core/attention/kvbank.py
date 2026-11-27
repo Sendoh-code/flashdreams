@@ -141,6 +141,54 @@ class CameraPoseRetrieval(KVRetrievalPolicy):
 
 
 @dataclass(kw_only=True)
+class LandmarkRetrieval(KVRetrievalPolicy):
+    """WorldTrace's Landmark writer (arXiv 2608.07408, Sec. 3.4): the ``k`` newest scene-entry frames.
+
+    A frame is a scene entry when the cosine distance between its keys and the
+    previous frame's exceeds ``threshold``. Needs no metadata. Meant for frame
+    granularity with pre-RoPE caching (``apply_rope_before_kvcache=False``):
+    the bank then holds WorldTrace's canonical keys, and the retrieve slots,
+    filled oldest first right before the window, are its virtual positions.
+    WorldTrace's Field (group means) and combined (attention-response error)
+    writers build new K/V instead of selecting entries, so they are not policies.
+    """
+
+    threshold: float = 0.5
+    """Scene-entry cosine distance. The paper gives no value; calibrate it from
+    the ``meta["key_dist"]`` this policy records on every entry it has scored."""
+
+    layer: int | None = None
+    """Index of the registered cache whose keys are compared; default the middle
+    one (unspecified in the paper). First-layer keys barely change between
+    frames: on LingBot 14B their distance stays near 0.005 whatever the camera does."""
+
+    def select(
+        self,
+        bank: KVBank,
+        query: KVBankEntry,
+        candidates: list[KVBankEntry],
+        k: int,
+    ) -> list[KVBankEntry]:
+        # Candidates have left the window, so their rows (and their
+        # predecessors') were final at the last host-synchronized begin_chunk.
+        layer = len(bank._caches) // 2 if self.layer is None else self.layer
+        keys = bank._store[id(bank._caches[layer])][0]
+        by_frame = {e.frame: e for e in bank.entries}
+        for c in candidates:
+            if "key_dist" not in c.meta:
+                prev = by_frame.get(c.frame - c.num_frames)
+                # No stored predecessor: the rollout (or the bank) starts here.
+                c.meta["key_dist"] = float("inf") if prev is None else 1 - float(
+                    torch.cosine_similarity(
+                        keys[c.slot].flatten().float(), keys[prev.slot].flatten().float(), dim=0
+                    )
+                )
+        marks = [c for c in candidates if c.meta["key_dist"] > self.threshold][-k:]
+        # Until k scene entries exist, the spare slots repeat the oldest one.
+        return [marks[0]] * (k - len(marks)) + marks if marks else []
+
+
+@dataclass(kw_only=True)
 class KVBankConfig:
     """Host K/V bank and retrieval knobs (frames are pre-patchify, like ``window_size_t``)."""
 
@@ -434,5 +482,6 @@ __all__ = [
     "KVBankConfig",
     "KVBankEntry",
     "KVRetrievalPolicy",
+    "LandmarkRetrieval",
     "RecentRetrieval",
 ]
