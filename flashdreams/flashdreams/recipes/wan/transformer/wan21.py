@@ -202,7 +202,11 @@ class Wan21TransformerConfig(TransformerConfig):
     bandwidth for the full visible history."""
 
     kv_bank: KVBankConfig | None = None
-    """Budgeted host K/V bank with metadata-driven retrieval (needs ``kv_offload``).
+    """Budgeted host K/V bank with metadata-driven retrieval.
+
+    With ``kv_offload`` everything streams through two device slots; without
+    it the caches stay on the device and only retrieved entries are copied in,
+    once per chunk (WorldKV's layout). Requires ``use_cuda_graph=False``.
 
     Self-attention then sees ``[sink | retrieve_size_t retrieved frames |
     window]``: the bank stores every chunk (or latent frame) generated past
@@ -291,11 +295,9 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
         len_t = config.len_t // kt
         window_size_t = config.window_size_t // kt
         sink_size_t = config.sink_size_t // kt
-        if config.kv_offload and config.use_cuda_graph:
-            raise ValueError("kv_offload requires use_cuda_graph=False.")
+        if (config.kv_offload or config.kv_bank is not None) and config.use_cuda_graph:
+            raise ValueError("kv_offload and kv_bank require use_cuda_graph=False.")
         if config.kv_bank is not None:
-            if not config.kv_offload:
-                raise ValueError("kv_bank requires kv_offload=True.")
             assert config.kv_bank.retrieve_size_t % kt == 0, (
                 f"kv_bank.retrieve_size_t ({config.kv_bank.retrieve_size_t}) must be "
                 f"divisible by patch_size[0] ({kt})"
@@ -508,7 +510,7 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
 
         # One offload shared by both branches keeps device K/V at two layers.
         kv_offload = None
-        if cfg.kv_offload:
+        if cfg.kv_offload or cfg.kv_bank is not None:
             bank = None
             if cfg.kv_bank is not None:
                 bank = KVBank(
@@ -517,7 +519,7 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
                     sink_frames=cfg.sink_size_t // kt,
                     window_frames=cfg.window_size_t // kt,
                 )
-            kv_offload = LayerwiseKVOffload(bank=bank)
+            kv_offload = LayerwiseKVOffload(bank=bank, resident=not cfg.kv_offload)
         network_cache = self._build_network_cache(
             text_embeddings=text_embeddings,
             image_embeddings=image_embeddings,

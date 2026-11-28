@@ -922,9 +922,21 @@ class LayerwiseKVOffload:
     With a caller's bank, each prefetch also fills the cache's retrieve region
     (the sink tail) with the entries its retrieval policy picked instead of the
     sink buffer's copy. Without one, :meth:`add` builds a window-only bank.
+
+    ``resident=True`` (needs a bank) keeps every cache on the device instead,
+    as WorldKV does: only the bank lives on host, each cache's retrieve region
+    is filled once per chunk on the compute stream, and the current chunk is
+    still written back to the bank after every layer.
     """
 
-    def __init__(self, bank: KVBank | None = None) -> None:
+    def __init__(self, bank: KVBank | None = None, *, resident: bool = False) -> None:
+        if resident and bank is None:
+            raise ValueError("resident mode needs a bank to retrieve from")
+        self.resident = resident
+        """Caches stay on the device; only bank entries cross PCIe."""
+        self._filled: set[int] = set()
+        self._dirty: set[int] = set()
+        self._chunk = -1
         self.bank = bank
         """Caller's bank (metadata + retrieval); ``None`` when only offloading."""
         self._bank = bank
@@ -944,9 +956,13 @@ class LayerwiseKVOffload:
         """Move ``cache`` storage to host; the first two device buffers become slots.
 
         Call right after each cache is built so peak device memory stays at a
-        few layers instead of the whole network.
+        few layers instead of the whole network. In resident mode the cache
+        keeps its device buffers and only gets a host sink buffer.
         """
-        if len(self._slots) < 2:
+        if self.resident:
+            if cache._k.device.type == "cuda":
+                self._stream = self._stream or torch.cuda.Stream(cache._k.device)
+        elif len(self._slots) < 2:
             # Reusing the cache's own buffers keeps any custom layout the
             # model chose (e.g. Lingbot's TMA-padded values).
             self._slots.append((cache._k, cache._v))
@@ -974,6 +990,8 @@ class LayerwiseKVOffload:
             torch.empty(k_shape, dtype=cache.dtype, pin_memory=pin),
             torch.empty(v_shape, dtype=cache.dtype, pin_memory=pin),
         )
+        if self.resident:
+            return
         self._idle[id(cache)] = cache._k, cache._v = (
             torch.empty(cache.k_shape, dtype=cache.dtype, device="meta"),
             torch.empty(cache.v_shape, dtype=cache.dtype, device="meta"),
@@ -993,17 +1011,29 @@ class LayerwiseKVOffload:
         """Synchronize, then let the bank allocate entries for ``chunk_idx``."""
         self.synchronize()
         assert self._bank is not None, "add() caches before the first chunk"
+        if chunk_idx != self._chunk:
+            self._chunk = chunk_idx
+            self._filled.clear()
         self._bank.begin_chunk(chunk_idx)
 
     def reset(self) -> None:
         """Forget per-rollout state (bank entries); buffers stay allocated."""
         self.synchronize()
+        self._chunk = -1
+        self._dirty.clear()
         if self._bank is not None:
             self._bank.reset()
 
     @torch.compiler.disable
     def before_layer(self, caches: Sequence[BlockKVCache], index: int) -> None:
         """Prefetch the next layer and bind ``caches[index]`` to its device slot."""
+        if self.resident:
+            cache = caches[index]
+            if id(cache) not in self._filled:  # first forward of the chunk
+                self._filled.add(id(cache))
+                for dst, src in self._retrieve_copies(cache, cache._k, cache._v):
+                    dst.copy_(src, non_blocking=True)
+            return
         if index == 0:
             self._prefetch(caches, 0)
         if index + 1 < len(caches):
@@ -1025,7 +1055,7 @@ class LayerwiseKVOffload:
         sink_k, sink_v = self._sink[id(cache)]
         start, end = cache._current_write_bounds()
         sink = cache._seq_slice(start, min(end, cache.sink_size))
-        timed = self._timing and self._stream is not None
+        timed = self._timing and self._stream is not None and not self.resident
         if timed:
             self._events[index]["compute_end"] = self._record()
         if self._stream is not None:
@@ -1041,7 +1071,8 @@ class LayerwiseKVOffload:
                 dst.copy_(src, non_blocking=True)
             if timed:
                 self._events[index]["writeback_end"] = self._record(self._stream)
-        cache._k, cache._v = self._idle[id(cache)]
+        if not self.resident:
+            cache._k, cache._v = self._idle[id(cache)]
         if timed and index == len(caches) - 1:
             self._pending.append(self._events)
             self._events = {}
@@ -1062,16 +1093,12 @@ class LayerwiseKVOffload:
         sink_k, sink_v = self._sink[id(cache)]
         bank = self._bank
         assert bank is not None
-        retrieved = bank.fetch(cache, slot_k, slot_v)
-        # Bank entries replace the sink buffer's copy of the retrieve region.
-        start = bank.memory_start(cache)
-        filled = len(retrieved) // 2 * bank.entry_tokens(cache)
-        sink_end = min(cache.size, cache.sink_size)
-        copies = retrieved + bank.window(cache, slot_k, slot_v)
-        for begin, end in [(0, min(start, sink_end)), (start + filled, sink_end)]:
-            if begin < end:
-                region = cache._seq_slice(begin, end)
-                copies += [(slot_k[region], sink_k[region]), (slot_v[region], sink_v[region])]
+        copies = self._retrieve_copies(cache, slot_k, slot_v)
+        copies += bank.window(cache, slot_k, slot_v)
+        sink_end = min(cache.size, bank.memory_start(cache))
+        if sink_end > 0:
+            region = cache._seq_slice(0, sink_end)
+            copies += [(slot_k[region], sink_k[region]), (slot_v[region], sink_v[region])]
         with self._side_stream():
             timed = self._timing and self._stream is not None
             if timed:
@@ -1087,6 +1114,30 @@ class LayerwiseKVOffload:
                     "fetch_end": self._record(self._stream),
                     "fetch_bytes": nbytes,
                 }
+
+    def _retrieve_copies(
+        self, cache: BlockKVCache, dst_k: Tensor, dst_v: Tensor
+    ) -> list[tuple[Tensor, Tensor]]:
+        """Copies filling the retrieve region: planned bank entries, then the sink buffer.
+
+        Resident caches hold their own sink, so they copy only while bank
+        entries replace part of it, or to restore it after that.
+        """
+        bank = self._bank
+        assert bank is not None
+        copies = bank.fetch(cache, dst_k, dst_v)
+        if self.resident:
+            if not copies and id(cache) not in self._dirty:
+                return []
+            (self._dirty.add if copies else self._dirty.discard)(id(cache))
+        start = bank.memory_start(cache)
+        begin = start + len(copies) // 2 * bank.entry_tokens(cache)
+        end = min(cache.size, cache.sink_size)
+        if begin < end:
+            sink_k, sink_v = self._sink[id(cache)]
+            region = cache._seq_slice(begin, end)
+            copies += [(dst_k[region], sink_k[region]), (dst_v[region], sink_v[region])]
+        return copies
 
     @staticmethod
     def _record(stream: torch.cuda.Stream | None = None) -> torch.cuda.Event:

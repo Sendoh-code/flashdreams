@@ -80,7 +80,7 @@ export SWEEP_ROOT=/path/to/kv_offload HF_HOME=/path/to/hf_cache \
 | --- | --- | --- | --- |
 | `test_block_kvcache_*`（多个） | `ci_cpu` / `ci_gpu` | `BlockKVCache` 的 sink + 滚动窗口语义与参考实现一致，含 compile / CUDA graph | 基础 KV cache 回归 |
 | `test_layerwise_offload_matches_resident_caches[sink,window]` | `ci_cpu` | offload（两个 slot + sink buffer + 以 bank 为窗口）在每层、每个去噪步看到的 K/V 和常驻 cache 完全一样；参数覆盖 sink、window 与 chunk 不对齐的情况；host 上不再有整层 home | offload 正确性、窗口索引、滚窗 |
-| `test_kv_bank_fills_retrieve_region[granularity-capacity]` | `ci_cpu` | attention 看到的是 `[sink | 策略选中的 bank 条目 | 窗口]`，FIFO 驱逐与独立模型一致；chunk / frame 粒度，预算无限 / 很小（会被抬到窗口大小） | bank 检索、驱逐、retrieve 区 |
+| `test_kv_bank_fills_retrieve_region[granularity-capacity-resident]` | `ci_cpu` | attention 看到的是 `[sink | 策略选中的 bank 条目 | 窗口]`，FIFO 驱逐与独立模型一致；chunk / frame 粒度，预算无限 / 很小（会被抬到窗口大小），offload 与常驻 bank 两种模式，含空检索时恢复 sink | bank 检索、驱逐、retrieve 区 |
 | `test_kv_bank_fills_retrieve_region_cuda[...]` | `ci_gpu` | 同上，但走 CUDA side stream + pinned 内存（真实的异步路径） | 流同步或竞态 |
 | `test_camera_pose_retrieval_picks_nearest_pose` | `ci_cpu` | `CameraPoseRetrieval` 按位姿距离取 top-k | 检索打分 |
 | `test_layerwise_offload_timing_reports_every_layer` | `ci_gpu` | `FLASHDREAMS_KV_OFFLOAD_TIMING` 每层都有 fetch/compute 计时，`fetch_mb` 正确，JSONL 落盘 | 计时诊断 |
@@ -92,7 +92,8 @@ export SWEEP_ROOT=/path/to/kv_offload HF_HOME=/path/to/hf_cache \
   integrations_v2/lingbot/tests/test_rope_kvcache.py -rs
 ```
 
-历史结果：`ci_cpu` 19 passed（2026-11-18，bank 成为唯一 host 存储之后）；
+历史结果：`test_kvcache.py` `ci_cpu` 23 passed、`ci_gpu` 15 passed（2026-11-25，RTX PRO 6000，含常驻 bank）；
+`ci_cpu` 19 passed（2026-11-18，bank 成为唯一 host 存储之后）；
 `ci_gpu` 6 passed / 1 skipped（job 23910329，2026-11-13，那次改动之前）。
 `bank_test.slurm` 第 1 步跑的就是这些测试的子集。
 
@@ -191,8 +192,8 @@ RTX PRO 6000 稳态逐层计时（窗口填满后的 forward，30 层）：offlo
   （`WORLDCACHE_IMPL.md` §6，job 24131186）之后 `roll` < 2 ms：offload-w40 5.10 → 3.29 s/chunk，
   ours 4.81 → 3.74 s/chunk，ours host RSS 50.9 → 39.5 GiB。第 0 个 chunk 的 `begin_chunk` 包含一次性的
   pinned bank 分配（ours 17.5 s，offload-w40 8.6 s），属于 warmup。
-- 质量：同一配置重复跑的视频之间 PSNR 只有约 22–25 dB（编译 / autotune 带来的非确定性），revisit PSNR
-  在 13.15–13.67 之间波动，改动前后的差异在噪声范围内。
+- 质量：同一配置重复跑的视频之间 PSNR 只有约 22–25 dB（编译 / autotune 带来的非确定性，§2.3 已确认：
+  eager 下 latent 逐位相同），revisit PSNR 在 13.15–13.67 之间波动，改动前后的差异在噪声范围内。
 - 稳态每层 fetch（offload-w40 17.4 ms，ours 20.5 ms）≈ compute（18.1 / 20.7 ms），H2D 已跑到 pinned 峰值
   约 24.5 GB/s，但被 compute 掩盖：每次 forward 的 stall 只有 39 / 54 ms（约 7%），offload-w40 只比 resident-w40
   慢 4%（3.29 vs 3.15 s/chunk）。所以现在**不是** H2D 瓶颈，去掉 `_prefetch` 的 `ponytail:` 暂不做；
@@ -276,6 +277,226 @@ H2D 57.7 GB/s。**14B 上 compute 仍然掩盖 fetch**，余量和 1.3B 相当�
 
 质量：14B 画面前景有一匹会动的大马和骑手，revisit PSNR 只有约 9 dB，不能和 1.3B 的数字比；
 单 seed 下三者差异属于噪声。相机跟随正常（光流 yaw 增益 1.04，相关系数 0.87）。
+
+### 2.3 WorldKV 设置、常驻 bank 与可复现性（RTX PRO 6000，2026-11-25）
+
+**问题**：按 WorldKV 自己的设置（v1 LingBot-World-Fast 14B，`len_t` 3，共 18 个 attended 帧）对比
+滑窗与检索，并看 offload 有没有改变结果。
+
+| run | 布局 | offload | 含义 |
+| --- | --- | --- | --- |
+| `wkv-baseline` | sink 6 + window 12 | 否 | v2 README 的策略 |
+| `wkv-resident` | sink 3 + 检索 9 + window 6，gap 6 | 否 | WorldKV `--use_retrieval --retrieval_frames 9`；cache 常驻显存，只有 bank 在 host（`kv_bank` 不带 `kv_offload`） |
+| `wkv-ours` | 同上 | 是 | 同上 + 逐层 offload |
+
+gap 6 = `CameraPoseRetrieval.min_gap_t`：WorldKV 把最近 6 帧排除在检索之外，虽然它只 attend 其中 3 帧。
+
+```bash
+MODEL=v1fast BLOCKS=30 RUN_TIMEOUT=3600 FLASHDREAMS_KV_OFFLOAD_TIMING=1 \
+  METRIC_ARGS="--len-t 3 --min-src 12 --min-gap 80 --baseline wkv-baseline" \
+  RUNS="wkv-baseline wkv-resident wkv-ours" SEED=42 OUT=$SWEEP_ROOT/wkv-$(date +%m%d)/seed42 \
+  bash experiments/kv_offload/compare.slurm
+```
+
+驱动脚本：`/mnt/datastore/yiti6755/kv_offload/wkv-1125/run.sh`（3 个 seed，bank 24 GB）和
+`wkv-1125-bank120/run.sh`（`BANK_GB=120`，30 个 chunk 全部可检索，外加一次 seed 42 resident 重复；
+这次重复没设 `BANK_GB`，实际是 24 GB）。161 个 revisit pair，遮掉面板。
+
+| | s/chunk | GPU GiB | revisit PSNR（42 / 43 / 44，均值） |
+| --- | --- | --- | --- |
+| wkv-baseline | 4.39–4.42 | 66.8 | 10.36 / 9.10 / 9.96，**9.81** |
+| wkv-resident，bank 24 GB | 4.48–4.52 | 66.8 | 9.24 / 10.17 / 9.29，9.57 |
+| wkv-ours，bank 24 GB | 4.43–4.45 | **47.5** | 7.93 / 9.68 / 8.49，8.70 |
+| wkv-resident，bank 120 GB | 4.49 | 66.8 | 8.82 / 9.36 / 8.83，9.00 |
+| wkv-ours，bank 120 GB | 4.44–4.45 | 47.5 | 7.53 / 8.61 / 7.43，7.86 |
+| wkv-resident 重复（seed 42） | 4.50 | 66.8 | 8.64（同配置第一次 9.24） |
+
+bank 120 GB 时 host RSS 约 180 GB，pinned 分配让单个 run 从约 4 分钟变成 8 分钟（resident）/ 24 分钟（ours），
+每 chunk 速度不变。检索没有赢过 baseline（WorldKV 自己的代码在 14B 上约 +0.9 dB）。
+
+**ours 比 resident 低 1 dB 不是 bug。** 6 对里 6 对 ours 更低，看起来像 offload 路径有错，于是做了逐位 parity：
+
+1. `test_kvcache.py`：`ci_cpu` 23 passed，`ci_gpu` 15 passed（含 resident 参数化的 bank 测试）。
+2. 同配置同 seed 跑两次，比较两段视频（x ≥ 0.5 W 的逐帧 PSNR），1.3B baseline，3 个 chunk：
+
+   | 设置 | 两次运行之间 | decode 前的 latent |
+   | --- | --- | --- |
+   | 默认编译（`max-autotune`） | 第 1 帧 33 dB，第 3 个 chunk 降到 25 dB，持续漂移 | – |
+   | `--no-compile` | 约 38 dB，不随时间变化 | **逐位相同** |
+   | `--no-compile` + `torch.use_deterministic_algorithms` / VAE decoder 也不编译 | 约 38 dB，无变化 | – |
+
+   编译后 Inductor 按计时挑 kernel，两次运行的 bf16 舍入不同，并在自回归里放大；第 0 个 chunk 还没有任何
+   历史就已经分叉。eager 下 latent 逐位相同，剩下的约 38 dB 来自 VAE decode / mp4 编码，不会回灌进 rollout。
+3. eager 1.3B，把 WorldKV 布局按 `len_t` 4 缩放（sink 4 + 检索 8 + window 8，gap 8，chunk bank），8 个 chunk：
+   resident vs offload 每个 chunk 的 latent **逐位相同**，有 bank、无 bank 都是。有效性检查：有 bank 与无 bank
+   恰好在第 5 个 chunk（开始检索）分叉；offload 那一路每次 forward 实际 H2D 5.56 GB。
+   没覆盖到：v1fast 14B、30 个 chunk、bank 驱逐。
+
+**结论**：编译过的单次录制不可复现，之前所有低于约 1 dB 的质量差异（§2 的 revisit PSNR、§2.1 的 +0.3–0.45 dB、
+§2.2、本节）都只能算噪声。以后做质量对比用 eager（`APP_ARGS=--no-compile`，同 seed 两组可以逐位配对；
+1.3B 约 1.6 s/chunk，编译后约 1.16），或者编译但用 ≥ 8 个 seed 做统计。
+
+**latent parity 工具**：`experiments/kv_offload/latent_parity.py` 包装 `flashdreams-run-v2`，把每次传给
+`WanVAE.decode` 的 latent 存到 `$LATENT_DIR/<n>.pt`，`--compare` 逐位比较两次 dump（全部相同返回 0）：
+
+```bash
+P=experiments/kv_offload/latent_parity.py
+for off in 0 1; do
+  KV_SWEEP_MODEL=1p3b KV_SWEEP_WINDOW_T=8 KV_SWEEP_SINK_T=4 KV_SWEEP_RETRIEVE_T=8 KV_SWEEP_RETRIEVE_GAP_T=8 \
+  KV_SWEEP_OFFLOAD=$off KV_SWEEP_ROPE=post KV_SWEEP_BANK_GRANULARITY=chunk KV_SWEEP_BANK_GB=24 \
+  LATENT_DIR=$OUT/lat-$off .venv/bin/python $P lingbot.apps.cam2v.kv_sweep --mode mp4 \
+    --output-path $OUT/off$off.mp4 --timeout unbound --backpressure-mode block --presentation-mode on_demand \
+    -- --example-data --example-idx 0 --pose-path WorldKV/traj/R_L_R_L_R_L90_360/R_L_R_L_R_L90_360_poses.npy \
+    --total-blocks 8 --warmup-blocks 0 --seed 42 --no-compile
+done
+.venv/bin/python $P --compare $OUT/lat-0 $OUT/lat-1
+```
+
+### 2.4 与 WorldKV 官方实现的正面对比（RTX PRO 6000，2026-11-25 至 11-26）
+
+**问题**：eager、指标对齐、同一场景、同样 18 个 attended latent 帧的条件下，(1) 我们的检索相对滑窗的增益
+是否和 WorldKV 官方代码一致；(2) 我们的实现是否比 WorldKV 官方检索（KV bank 在 CPU）快。
+
+**中间排查的结论**（都是 eager，`--no-compile`）：
+
+| 现象 | 结论 | 数据目录 |
+| --- | --- | --- |
+| 编译运行里 ours 比 resident 低 1 dB | 噪声。14B eager 下两者每个 seed 的 revisit PSNR 相同（13.05 / 9.01 / 14.94 对 13.05 / 9.00 / 14.94）；14B eager 和编译一样快（约 4.4 s/chunk） | `wkv-1125-eager-bank120/`、`wkv-1126-final/` |
+| bank 24 GB | 14B 上只放得下约 6 个 chunk，检索不到早期历史；必须 `BANK_GB=120` | `wkv-1125-eager/` |
+| 我们的 baseline 比 WorldKV 的 baseline 强 | sink 6 + window 12（`wkv-baseline`）比 WorldKV 自己的 sink 3 + recent 15 高约 0.7 dB（dragon 场景）。新增 run `wkv-slide`（window 15 / sink 3）作为同口径 baseline | `wkv-1125-eager/` |
+| 和 WorldKV 官方 baseline 绝对值差约 2 dB | 场景不同：flashdreams example 0 是骑龙，WorldKV 用 `examples/new/00.png`（村庄）。两边相机 yaw 增益都约 1.0 | `wkv-1126-scene/` |
+| revisit pair 没对齐 | `compare_metrics.py` 用了按 latent 分段常数的 pose，且没去掉 mp4 开头的黑色等待帧。已修（见下） | – |
+| 检索选帧 | 离线重放 WorldKV 的选择逻辑，26 个 chunk 里 23 个一致，其余来自约 1° 的 pose 采样偏移 | `wkv-1126-scene/seed44/` 的 `picks.txt` |
+| seed 43 检索掉 2.7 dB | 内容漂移：约第 16 个 chunk 起一匹大马进入前景，不是数值问题 | `wkv-1126-scene/seed43/` |
+
+**指标对齐**（`compare_metrics.py`）：flashdreams 的 mp4 比生成帧多一个开头的黑帧（358 对 357），现在按
+`(帧数 − 1) % 4` 去掉；pose 用原始逐帧 pose（flashdreams 第 f 帧对应第 f 个 pose）；WorldKV 的视频把 360 个
+pose 均匀摊到整段视频上，评分时加 `--stretch-poses`。`stats.json` / `run.log` 变为可选，所以同一个脚本能给
+WorldKV 的输出打分。`--self-check` 覆盖 `video_poses`。
+
+**四个 arm**（都是 18 个 attended latent 帧，v1 LingBot-World-Fast 14B，30 个 chunk，seed 42–45）：
+
+| arm | 代码 | 布局 |
+| --- | --- | --- |
+| `flashdreams/wkv-slide` | 本仓库，eager | sink 3 + recent 15，全部在显存 |
+| `flashdreams/wkv-ours` | 本仓库，eager | sink 3 + 检索 9 + recent 6（gap 6），逐层 offload + 120 GB host bank |
+| `worldkv/sink3-recent15` | WorldKV `generate_fast.py` | `--sliding_window 18 --sliding_window_sink 3` |
+| `worldkv/wr9` | WorldKV `generate_fast.py` | `--use_retrieval --retrieval_frames 9`，KV bank 在 CPU |
+
+```bash
+R=/mnt/datastore/yiti6755/kv_offload/wkv-1126-final
+bash $R/run.sh                      # 约 2 小时；日志 $R/driver.log，以 "all done" 结束
+python3 $R/aggregate.py > $R/results.md
+# flashdreams 单个 seed 的等价命令：
+SCENE=/mnt/datastore/yiti6755/kv_offload/wkv-1126-scene; T=WorldKV/traj/R_L_R_L_R_L90_360
+TORCHINDUCTOR_CACHE_DIR=/mnt/datastore/yiti6755/inductor_cache \
+MODEL=v1fast BLOCKS=30 BANK_GB=120 RUN_TIMEOUT=3600 FLASHDREAMS_KV_OFFLOAD_TIMING=1 \
+  APP_ARGS="--no-compile --image-path $SCENE/inputs/00.png --prompt-path $SCENE/inputs/prompt.txt --intrinsic-path $T/R_L_R_L_R_L90_360_intrinsics.npy" \
+  METRIC_ARGS="--len-t 3 --min-src 12 --min-gap 80 --baseline wkv-slide" \
+  RUNS="wkv-slide wkv-ours" SEED=42 OUT=$R/flashdreams/seed42 bash experiments/kv_offload/compare.slurm
+```
+
+不设 `TORCHINDUCTOR_CACHE_DIR` 会落到 `/work`，报 `PermissionError`。WorldKV 一侧（gitignored 的克隆）有两处本地
+改动：SDPA 回退（这块显卡没有 flash-attn 的 wheel）和 `wan/image2video_fast.py` 里的计时点（设
+`WKV_TIMING_JSON` 才输出；原文件备份在 `WorldKV/repro/image2video_fast.before_timing.py`）。
+
+**质量**（revisit pair，遮掉面板，seed 42 / 43 / 44 / 45）：
+
+| arm | PSNR 均值 ± sd | 各 seed PSNR | SSIM 均值 | 各 seed SSIM |
+| --- | --- | --- | --- | --- |
+| flashdreams/wkv-slide | 12.97 ± 1.04 | 12.70 / 11.68 / 13.39 / 14.13 | 0.37 | 0.360 / 0.365 / 0.367 / 0.382 |
+| flashdreams/wkv-ours | 13.13 ± 2.94 | 13.05 / 9.00 / 14.94 / 15.52 | 0.38 | 0.377 / 0.318 / 0.403 / 0.423 |
+| worldkv/sink3-recent15 | 12.59 ± 1.24 | 11.57 / 14.14 / 11.61 / 13.06 | 0.35 | 0.339 / 0.354 / 0.372 / 0.323 |
+| worldkv/wr9 | 13.92 ± 1.27 | 12.18 / 14.99 / 13.75 / 14.75 | 0.39 | 0.360 / 0.385 / 0.419 / 0.377 |
+
+检索相对同代码库滑窗的增益（按 seed 配对）：
+
+| 代码库 | ΔPSNR 均值 ± sd | 各 seed ΔPSNR | ΔSSIM 均值 | 各 seed ΔSSIM |
+| --- | --- | --- | --- | --- |
+| flashdreams | +0.15 ± 1.96 | +0.34 / −2.67 / +1.55 / +1.40 | +0.01 | +0.017 / −0.047 / +0.036 / +0.042 |
+| WorldKV | +1.32 ± 0.72 | +0.62 / +0.84 / +2.15 / +1.69 | +0.04 | +0.021 / +0.031 / +0.047 / +0.055 |
+
+去掉 seed 43，ours 平均 +1.10 dB，WorldKV +1.49 dB。两个代码库同一 seed 的噪声不同，内容不一样，不能逐 seed
+对比；只有一个场景、4 个 seed，无法判断 seed 43 是偶然还是我们的实现更容易漂移。**"增益一致"目前不成立，也没有被否定。**
+
+**速度与资源**（各 seed 取中位数；每 chunk 的值取第 8 个 chunk 之后的中位数；fps 是解码后的视频帧率，
+每 chunk 12 帧，含解码）：
+
+| 指标 | fd 滑窗 | ours | WorldKV 滑窗 | WorldKV 检索 |
+| --- | --- | --- | --- | --- |
+| 每 chunk 耗时 s（中位 / p90） | 4.44 / 4.45 | 4.50 / 4.50 | 5.83 / 5.89 | 7.84 / 7.88 |
+| 视频帧率 fps（含解码） | 2.70 | 2.67 | 1.76 | 1.36 |
+| 4 步去噪 s | 3.19 | 3.23 | 4.67 | 4.80 |
+| 干净 latent 前向（KV 刷新）s | 0.74 | 0.76 | 1.15 | 1.19 |
+| 检索取回 s | – | 含在逐层 fetch 里 | 0 | 0.36 |
+| 存入 bank s | – | 含在逐层写回里 | 0 | 1.48 |
+| VAE 解码 s/chunk | 0.50 | 0.51 | 1.00（摊算） | 1.00（摊算） |
+| 逐层 fetch / compute / stall ms | – | 9.6 / 19.3 / 9.7 | – | – |
+| 每次 forward H2D GB | – | 22.2 | – | – |
+| bank 分配 s（启动一次） | – | 33.7 | – | – |
+| 生成总时长 s（30 chunk） | 130 | 190 | 201 | 258 |
+| GPU 峰值 GiB | 66.8 | 47.5 | 59.2 | 78.5 |
+| host RSS 峰值 GiB | 70.2 | 182.7 | 49.7 | 152.8 |
+
+- ours 每 chunk 比 WorldKV 官方检索快 1.74 倍，显存少 31 GiB。
+- 检索的额外开销：ours 相对自己的滑窗 +0.06 s/chunk，WorldKV +2.0 s/chunk（同步存 CPU bank 1.48 s，取回 0.36 s，
+  显存多 19 GiB）。
+- 口径：WorldKV 的滑窗本身就比 flashdreams 慢 1.3 倍（SDPA 回退，框架差异），所以 1.74 倍不全是 KV 方案的功劳；
+  WorldKV 在最后一次性解码，表里按 chunk 摊算；进程墙钟时间不可比（120 GB pinned 内存挤掉页缓存，模型加载
+  要 8–15 分钟）。
+
+### 2.5 WorldKV 复查：多场景与无 sink 的 FIFO 基线（RTX PRO 6000，2026-11-26 至 11-27）
+
+目录 `/mnt/datastore/yiti6755/kv_offload/wkv-1127-scenes/`（`run.sh`、`run_fifo.sh`），7 个场景（WorldKV 村庄 + 6 个 lb），
+seed 42，360 帧纯 yaw 轨迹。WorldKV 侧三个 arm：`fifo18`（官方 `--sliding_window`，无 sink）、`sink3-recent15`
+（本地补丁 `--sliding_window_sink`）、`wr9`（检索）。结果表见 `WORLDCACHE.md`。
+
+- 6 个 lb 场景均值：fifo18 9.28、sink 10.56、wr9 10.33 dB。相对 FIFO 的提升主要来自 sink（+1.29），检索在 sink 之上是 −0.24。
+- 论文的 +3.5 dB 对的是无 sink 的 FIFO（由仓库 flag 和项目页视频名推断，论文没明说），只有村庄场景能看到这个量级。
+- 论文的 60 个 scene-trajectory benchmark 没有放出。
+
+### 2.6 WorldTrace Landmark（RTX PRO 6000，2026-11-26 至 11-27）
+
+全部是 v1fast 14B、eager（`APP_ARGS=--no-compile`）、村庄场景、seed 42，每个 arm 都看 18 个 latent 帧。
+
+| 实验 | 目录（`/mnt/datastore/yiti6755/kv_offload/`） | 内容 |
+| --- | --- | --- |
+| 首次端到端 | `wt-1126-landmark/` | τ 0.5、第 0 层；`key_dist_runner.py` 包住 `LandmarkRetrieval.select`，把每帧 5 个层的 key 距离和每个 chunk 的选择写到 `$KEYDIST_JSONL` |
+| 带停留的环路 | `wt-1127-loops/` | `_W_S__177`、`_R_L_48_177`、`_W_R_L_48_225`、`_W_S_W_S__369`，τ 0.25 |
+| LoopBench 拓扑 | `wt-1127-aba/` | `WWWWSSSS_201`（ABA）、`WWWWWWWWSSSSSSSS_393`（ABA long）、`WWWWSSSSWWWWSSSS_393`（ABABA），τ 0.25；`tau0.4/` 是两个 Landmark arm 在 τ 0.4 下的重跑 |
+
+轨迹用 `WorldKV/generate_traj.py` 生成，帧数取 `4L−3` 且 `L` 被 3 整除，两边代码都不重采样位姿。例：
+
+```bash
+cd WorldKV && ../.venv/bin/python generate_traj.py --frames 201 --trajectory WWWWSSSS
+cd .. && TAU=0.4 bash /mnt/datastore/yiti6755/kv_offload/wt-1127-aba/run_tau04.sh
+# WorldTrace 的指标（DINOv2 / LPIPS），对已有视频重新打分：
+uv run --no-sync --with lpips python experiments/kv_offload/compare_metrics.py <out_dir> --poses <poses.npy> \
+  --len-t 3 --min-src 12 --min-gap 80 --baseline wt-slide --perceptual
+```
+
+结论（数字见 `WORLDCACHE.md`）：
+
+- 相邻帧 key 距离反映相机运动快慢，不是「进入新场景」：中间层运动时 0.30–0.56，长停留 0.07–0.27；第 0 层恒约 0.005，不可用。
+- τ 0.25 下几乎每帧都被标记，Landmark 退化成滑动窗口；τ 0.4 开始筛帧，DINOv2 在 6 格里 5 格提升，但基本不超过 sink 基线。
+- 按 DINOv2，位姿检索（`wkv-ours`）在三条 ABA 轨迹上都第一（0.61–0.63）；按 PSNR 没有稳定的顺序。两种指标的排序不一致，只有一个 seed。
+- 没有停留的闭环（如正方形 `WWDDSSAA_201`）找不到同位姿帧对，打不了分；要评闭环必须在起点停留。
+- 注意加载时间：带 120 GB bank 的 arm 会把权重挤出页缓存，下一个 arm 冷读要 10 分钟以上。201 帧的轨迹用 `BANK_GB=75` 可以避免。
+
+### 2.7 CUDA graph 上限（RTX PRO 6000，2026-11-27）
+
+目录 `/mnt/datastore/yiti6755/kv_offload/graph-1127/`（`run.sh`）。不带 bank 的 `wkv-slide`，30 个 chunk，
+eager / 编译 × `KV_SWEEP_CUDA_GRAPH=0/1`。稳态每 chunk 去噪时间（第 10–29 个 chunk 的中位数）：
+
+| 组合 | ms |
+| --- | --- |
+| eager | 3189 |
+| eager + graph | 3211 |
+| 编译 | 3176 |
+| 编译 + graph | 3154 |
+
+14B 上开图和编译各自的影响都不到 2%，所以不值得为 bank / offload 路径设计专门的捕获策略。图是否被捕获没有日志，
+依据是开图时显存多 36 MB。1.3B 上没有测。
 
 ---
 
@@ -361,5 +582,6 @@ sweep 本身还没在这台机器上跑。
    （验证滚窗开销是否消失），再跑 `RUNS="baseline resident-w40"` 补齐对照。
 4. `bank_test.slurm` 跑 pre/post-RoPE 与粒度矩阵。
 5. 需要带宽结论时再跑第 4 节的 sweep。
+6. 质量对比加 `APP_ARGS=--no-compile`（§2.3：编译后的运行不可复现）。
 
 新的结果写回 `WORLDCACHE.md` 的 Status，并在本文件的历史结果表里追加一行（注明 GPU 型号和 commit）。

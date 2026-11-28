@@ -10,6 +10,7 @@ from flashdreams.core.attention.kvbank import (
     KVBankConfig,
     KVBankEntry,
     KVRetrievalPolicy,
+    LandmarkRetrieval,
     RecentRetrieval,
 )
 from flashdreams.core.attention.kvcache import (
@@ -37,6 +38,7 @@ __all__ = [
     "KVBankEntry",
     "KVCacheRelativeRotaryPositionEmbedding3D",
     "KVRetrievalPolicy",
+    "LandmarkRetrieval",
     "LayerKV",
     "LayerwiseKVOffload",
     "NativeAttention",
